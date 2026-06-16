@@ -3,6 +3,14 @@ name = "lit-bridge-rs"
 version = "0.0.1"
 edition = "2021"
 description = "Native cross-platform replacement for lit-bridge: drives interactive AI CLI sessions under a real PTY (ConPTY/forkpty), speaks the lit-bridge JSON-lines protocol over a socket. No tmux."
+authors = ["Positronic AI, Inc. <hello@positronic.ai>"]
+license = "BUSL-1.1"
+readme = "README.md"
+homepage = "https://lit.ai/lit-bridge"
+repository = "https://github.com/Positronic-AI/lit-bridge-rs"
+keywords = ["ai", "cli", "claude", "pty", "terminal"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false   # source-available (BSL), not a crates.io package
 
 [dependencies]
 portable-pty = "0.8"   # ConPTY (Windows) / forkpty (Unix) — proven in the spike

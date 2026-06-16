@@ -573,10 +573,12 @@ async fn handle_attach(mon: Rc<Mutex<Monitor>>, stream: tokio::net::UnixStream) 
     };
 
     // Subscribe to live output + grab the current screen for the initial paint.
+    // Use the *formatted* capture so color/styling render immediately (it carries its
+    // own SGR + cursor positioning, so no newline translation is needed).
     let (mut rx, paint) = {
         let m = mon.lock().await;
         match m.sessions.get(&key) {
-            Some(s) => (s.subscribe(), s.capture()),
+            Some(s) => (s.subscribe(), s.capture_formatted()),
             None => {
                 let _ = wh
                     .write_all(format!("\r\nlit-bridge-rs: no such session '{key}'\r\n").as_bytes())
@@ -586,7 +588,7 @@ async fn handle_attach(mon: Rc<Mutex<Monitor>>, stream: tokio::net::UnixStream) 
         }
     };
     let _ = wh.write_all(b"\x1b[2J\x1b[H").await; // clear + home
-    let _ = wh.write_all(paint.replace('\n', "\r\n").as_bytes()).await;
+    let _ = wh.write_all(&paint).await;
 
     // Forward live PTY output → terminal client.
     let out = tokio::task::spawn_local(async move {

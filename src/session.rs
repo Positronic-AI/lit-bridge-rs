@@ -88,6 +88,13 @@ impl Session {
         ] {
             cmd.env_remove(k);
         }
+        // Advertise a real color terminal. tmux did this for us implicitly (its
+        // default-terminal + 256-color advertisement inside the pane); under a raw PTY
+        // the child inherits the daemon's env, which as a service is often TERM=dumb or
+        // unset — so Claude downgrades to plain ASCII with no color or unicode spinner
+        // animations. Set sane defaults BEFORE the caller's env so `create.env` can override.
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -173,11 +180,22 @@ impl Session {
         let _ = self.writer.flush();
     }
 
-    /// The rendered visible screen — the `tmux capture-pane -p` analogue.
+    /// The rendered visible screen as plain text — the `tmux capture-pane -p`
+    /// analogue. Used by the parser/observer (which wants un-styled text).
     pub fn capture(&self) -> String {
         self.screen
             .lock()
             .map(|g| g.screen().contents())
+            .unwrap_or_default()
+    }
+
+    /// The rendered screen WITH styling (SGR color attributes + cursor positioning),
+    /// as a terminal byte stream. Used to paint a freshly-attached terminal client so
+    /// it shows color immediately instead of waiting for the CLI's next full redraw.
+    pub fn capture_formatted(&self) -> Vec<u8> {
+        self.screen
+            .lock()
+            .map(|g| g.screen().contents_formatted())
             .unwrap_or_default()
     }
 
