@@ -1,0 +1,17 @@
+[package]
+name = "lit-bridge-rs"
+version = "0.0.1"
+edition = "2021"
+description = "Native cross-platform replacement for lit-bridge: drives interactive AI CLI sessions under a real PTY (ConPTY/forkpty), speaks the lit-bridge JSON-lines protocol over a socket. No tmux."
+
+[dependencies]
+portable-pty = "0.8"   # ConPTY (Windows) / forkpty (Unix) — proven in the spike
+vt100 = "0.15"         # in-process terminal emulator; the `capture-pane` analogue
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time", "sync"] }
+serde_json = "1"
+anyhow = "1"
+regex = "1"
+
+[[bin]]
+name = "lit-bridge-rs"
+path = "src/main.rs"
