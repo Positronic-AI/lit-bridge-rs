@@ -533,7 +533,15 @@ impl TuiParser for ClaudeV21Parser {
                     }
                 }
                 if let Some(lb) = last_bullet {
-                    if (lb as i64) > baseline_star_idx {
+                    // The bullet must belong to the CURRENT turn, i.e. sit AFTER the
+                    // current prompt (`❯`). Without this, during the thinking phase
+                    // (a ✻ spinner is up but the model hasn't written a new `●` yet)
+                    // this fallback grabbed the PREVIOUS turn's last bullet — the prior
+                    // response — and streamed it back as if it were the new one. It
+                    // self-corrected once a real new `●` landed, but the user saw their
+                    // last answer flash as the "response" while waiting.
+                    let after_prompt = last_prompt_idx.map(|lp| lb > lp).unwrap_or(true);
+                    if (lb as i64) > baseline_star_idx && after_prompt {
                         start_idx = Some(lb);
                         for i in (lb + 1)..content_end {
                             if self.is_completion(lines[i].trim()) {

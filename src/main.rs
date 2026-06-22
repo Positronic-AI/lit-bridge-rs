@@ -14,11 +14,46 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::OwnedWriteHalf;
-use tokio::net::UnixListener;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::LocalSet;
+
+/// Boxed half-streams so the same session code drives either transport: a Unix
+/// domain socket (Linux — local + SSH/socat) or a TCP loopback socket (Windows,
+/// where Unix sockets and tmux never existed). The runtime is single-threaded
+/// (`current_thread` + LocalSet), so these trait objects need not be `Send`.
+type BoxRead = Box<dyn AsyncRead + Unpin>;
+type BoxWrite = Box<dyn AsyncWrite + Unpin>;
+
+/// A bound control/attach socket. The Unix arm is compiled out entirely on
+/// Windows (tokio's `UnixListener` is `#[cfg(unix)]`), leaving TCP as the only
+/// transport there.
+enum Listener {
+    #[cfg(unix)]
+    Unix(tokio::net::UnixListener),
+    Tcp(TcpListener),
+}
+
+impl Listener {
+    /// Accept one connection and hand back boxed read/write halves.
+    async fn accept_split(&self) -> std::io::Result<(BoxRead, BoxWrite)> {
+        match self {
+            #[cfg(unix)]
+            Listener::Unix(l) => {
+                let (s, _) = l.accept().await?;
+                let (r, w) = s.into_split();
+                Ok((Box::new(r), Box::new(w)))
+            }
+            Listener::Tcp(l) => {
+                let (s, _) = l.accept().await?;
+                let _ = s.set_nodelay(true);
+                let (r, w) = s.into_split();
+                Ok((Box::new(r), Box::new(w)))
+            }
+        }
+    }
+}
 
 use lit_bridge_rs::parser::{select_parser, SessionState, TuiParser};
 use lit_bridge_rs::session::Session;
@@ -36,7 +71,7 @@ const MAX_TURN: Duration = Duration::from_secs(600); // hard cap so we never han
 
 struct Monitor {
     sessions: HashMap<String, Session>,
-    client: Option<OwnedWriteHalf>,
+    client: Option<BoxWrite>,
     buffer: VecDeque<String>,
     parser: Box<dyn TuiParser>,
     /// session key → stashed Claude session id, for `--resume` on the next create
@@ -56,6 +91,20 @@ impl Monitor {
     }
 
     async fn emit(&mut self, v: Value) {
+        // Diagnostic capture (off unless LIT_BRIDGE_RS_EVENTLOG is set): record the
+        // session + event type, and for content-bearing events the length, so a lost
+        // or repeated message can be reconstructed without re-running blind.
+        {
+            let sess = v.get("session").and_then(|x| x.as_str()).unwrap_or("-");
+            let ev = v.get("event").and_then(|x| x.as_str()).unwrap_or("-");
+            let detail = v
+                .get("content")
+                .or_else(|| v.get("text"))
+                .and_then(|x| x.as_str())
+                .map(|s| format!(" len={}", s.chars().count()))
+                .unwrap_or_default();
+            lit_bridge_rs::diag::log("EMIT", &format!("{sess} {ev}{detail}"));
+        }
         let mut line = v.to_string();
         line.push('\n');
         if let Some(w) = &mut self.client {
@@ -75,7 +124,7 @@ impl Monitor {
         self.buffer.push_back(line);
     }
 
-    async fn attach_client(&mut self, mut w: OwnedWriteHalf) -> Result<()> {
+    async fn attach_client(&mut self, mut w: BoxWrite) -> Result<()> {
         // Handshake: the Connector expects monitor_ready first.
         let ready = json!({
             "event": "monitor_ready",
@@ -413,7 +462,12 @@ impl Monitor {
                 // transcript only lands at turn-end). Emit `replace` when the scraped
                 // text changes; the clean JSONL `complete` swaps in at the end. Skip
                 // updates that would drop the response bullet (avoids flicker).
-                if s.observing {
+                //
+                // While a dialog/question picker is up (e.g. AskUserQuestion), the scrape
+                // is picker chrome, not response text — streaming it would clobber the
+                // structured tool_use (the interactive question) the frontend renders from
+                // JSONL. So suppress the scrape in Dialog state and let the question show.
+                if s.observing && new_state != SessionState::Dialog {
                     let resp =
                         self.parser
                             .extract_raw_response(s.baseline_msgs, &cap, Some(&s.sent), 0);
@@ -500,30 +554,49 @@ async fn finalize_create(
     }
 
     // Auto-dismiss startup dialogs so the session reaches an interactive prompt.
-    for _ in 0..6 {
+    //
+    // Dialogs (workspace-trust, bypass-permissions, theme) can render SECONDS after
+    // spawn — especially under ConPTY on Windows, where claude boots slowly. The old
+    // loop bailed on the first dialog-free frame, so on a slow boot it gave up before
+    // the trust dialog ever appeared and the session wedged on it. Instead, keep
+    // watching until the prompt is genuinely interactive (idle) or we hit a ceiling,
+    // dismissing any dialog we encounter along the way.
+    let dialog_deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if Instant::now() > dialog_deadline {
+            break;
+        }
         let cap = match mon.lock().await.sessions.get(&key).map(|s| s.capture()) {
             Some(c) => c,
             None => break,
         };
+        // Bind to a local so the lock guard from the scrutinee is released here —
+        // an `if let mon.lock()...` would hold it across the block and deadlock the
+        // re-lock below (the async Mutex is not reentrant).
         let dialog = mon.lock().await.parser.is_startup_dialog(&cap);
-        match dialog {
-            Some((_, keys, name)) => {
-                {
-                    let mut m = mon.lock().await;
-                    if let Some(s) = m.sessions.get_mut(&key) {
-                        for k in &keys {
-                            let _ = s.send_key(k);
-                        }
+        if let Some((_, keys, name)) = dialog {
+            {
+                let mut m = mon.lock().await;
+                if let Some(s) = m.sessions.get_mut(&key) {
+                    for k in &keys {
+                        let _ = s.send_key(k);
                     }
                 }
-                mon.lock()
-                    .await
-                    .emit(json!({"session": key, "event": "dialog_dismissed", "dialog": name}))
-                    .await;
-                tokio::time::sleep(Duration::from_millis(1000)).await;
             }
-            None => break,
+            mon.lock()
+                .await
+                .emit(json!({"session": key, "event": "dialog_dismissed", "dialog": name}))
+                .await;
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            continue;
         }
+        // No dialog visible. If the prompt is interactive we're done; otherwise the
+        // CLI may still be booting (or a dialog is about to appear) — wait and re-check.
+        let state = mon.lock().await.parser.detect_state(&cap);
+        if state == SessionState::Idle {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
     mon.lock()
@@ -539,9 +612,7 @@ async fn finalize_create(
 /// sends ONE selector line (`{"session":"…","channel_id":"…"}` or a bare key), then it's
 /// a bidirectional raw byte pipe — live PTY output out, keystrokes in. On attach we paint
 /// the current rendered screen so the terminal isn't blank.
-async fn handle_attach(mon: Rc<Mutex<Monitor>>, stream: tokio::net::UnixStream) {
-    let (mut rh, mut wh) = stream.into_split();
-
+async fn handle_attach(mon: Rc<Mutex<Monitor>>, mut rh: BoxRead, mut wh: BoxWrite) {
     // Read the one-line session selector.
     let mut sel = Vec::new();
     let mut b = [0u8; 1];
@@ -633,6 +704,8 @@ fn model_from_args(args: &[String]) -> Option<String> {
     None
 }
 
+// Only referenced by the Unix-socket bind path; unused when compiled for Windows.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn arg(flag: &str, default: &str) -> String {
     let a: Vec<String> = std::env::args().collect();
     if let Some(i) = a.iter().position(|x| x == flag) {
@@ -643,22 +716,61 @@ fn arg(flag: &str, default: &str) -> String {
     default.to_string()
 }
 
+fn arg_opt(flag: &str) -> Option<String> {
+    let a: Vec<String> = std::env::args().collect();
+    a.iter()
+        .position(|x| x == flag)
+        .and_then(|i| a.get(i + 1).cloned())
+}
+
+/// Bind the control listener and the optional raw-PTY attach listener.
+///
+/// `--port N` selects TCP loopback (control on `127.0.0.1:N`, attach on `N+1`) —
+/// the cross-platform path, and the only one available on Windows. Otherwise we
+/// fall back to a Unix socket at `--socket` (attach at `<socket>.attach`), which
+/// is what the Linux local + SSH/socat path expects.
+async fn bind_listeners() -> Result<(Listener, Option<Listener>)> {
+    if let Some(port) = arg_opt("--port") {
+        let port: u16 = port
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid --port: {port}"))?;
+        let ctrl = TcpListener::bind(("127.0.0.1", port)).await?;
+        eprintln!("lit-bridge-rs listening on tcp://127.0.0.1:{port}");
+        let attach = TcpListener::bind(("127.0.0.1", port + 1)).await.ok();
+        if attach.is_some() {
+            eprintln!("lit-bridge-rs attach socket on tcp://127.0.0.1:{}", port + 1);
+        }
+        return Ok((Listener::Tcp(ctrl), attach.map(Listener::Tcp)));
+    }
+
+    #[cfg(unix)]
+    {
+        let socket = arg("--socket", "/tmp/lit-bridge-rs.sock");
+        let _ = std::fs::remove_file(&socket);
+        let ctrl = tokio::net::UnixListener::bind(&socket)?;
+        eprintln!("lit-bridge-rs listening on {socket}");
+
+        let attach_path = format!("{socket}.attach");
+        let _ = std::fs::remove_file(&attach_path);
+        let attach = tokio::net::UnixListener::bind(&attach_path).ok();
+        if attach.is_some() {
+            eprintln!("lit-bridge-rs attach socket on {attach_path}");
+        }
+        Ok((Listener::Unix(ctrl), attach.map(Listener::Unix)))
+    }
+    #[cfg(not(unix))]
+    {
+        anyhow::bail!("--port <N> is required on this platform (no Unix socket support)")
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let socket = arg("--socket", "/tmp/lit-bridge-rs.sock");
-    let _ = std::fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket)?;
-    eprintln!("lit-bridge-rs listening on {socket}");
-
-    // Raw PTY attach socket (the escape hatch): a terminal client connects here, sends a
-    // one-line session selector, then gets a live bidirectional byte pipe to the PTY —
-    // for slash commands, dismissing odd dialogs, and diagnostics when scraping falls short.
-    let attach_path = format!("{socket}.attach");
-    let _ = std::fs::remove_file(&attach_path);
-    let attach_listener = UnixListener::bind(&attach_path).ok();
-    if attach_listener.is_some() {
-        eprintln!("lit-bridge-rs attach socket on {attach_path}");
-    }
+    // Control listener + optional raw-PTY attach listener (the escape hatch: a
+    // terminal client connects, sends a one-line session selector, then gets a
+    // live bidirectional byte pipe to the PTY — for slash commands, dismissing
+    // odd dialogs, and diagnostics when scraping falls short).
+    let (listener, attach_listener) = bind_listeners().await?;
 
     let local = LocalSet::new();
     local
@@ -680,8 +792,8 @@ async fn main() -> Result<()> {
                 let mon_a = mon.clone();
                 tokio::task::spawn_local(async move {
                     loop {
-                        if let Ok((stream, _)) = al.accept().await {
-                            tokio::task::spawn_local(handle_attach(mon_a.clone(), stream));
+                        if let Ok((rh, wh)) = al.accept_split().await {
+                            tokio::task::spawn_local(handle_attach(mon_a.clone(), rh, wh));
                         }
                     }
                 });
@@ -689,8 +801,7 @@ async fn main() -> Result<()> {
 
             // One client at a time; reconnect-friendly (events buffer while detached).
             loop {
-                let (stream, _) = listener.accept().await?;
-                let (rh, wh) = stream.into_split();
+                let (rh, wh) = listener.accept_split().await?;
                 mon.lock().await.attach_client(wh).await?;
                 let mut lines = BufReader::new(rh).lines();
                 while let Ok(Some(l)) = lines.next_line().await {

@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -38,6 +39,10 @@ pub struct Session {
     /// Watches Claude Code's JSONL transcript for clean content + tool events.
     pub jsonl: Option<JsonlWatcher>,
     writer: Box<dyn Write + Send>,
+    /// Set when the CLI requests win32-input-mode (`ESC[?9001h`) — on Windows the
+    /// interactive Claude TUI negotiates this and ignores legacy VT keystrokes, so
+    /// we must encode input as win32 input records. Cleared on `ESC[?9001l`.
+    win32: Arc<AtomicBool>,
     screen: Arc<Mutex<vt100::Parser>>,
     /// Live tee of the raw PTY output, for terminal-attach clients (the escape hatch).
     output_tx: broadcast::Sender<Vec<u8>>,
@@ -46,7 +51,37 @@ pub struct Session {
     child: Box<dyn Child + Send + Sync>,
 }
 
+/// One win32-input-mode key event (down + up): `ESC [ Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`.
+fn w32_record(vk: u16, sc: u16, uc: u32, cs: u32) -> String {
+    format!(
+        "\x1b[{vk};{sc};{uc};1;{cs};1_\x1b[{vk};{sc};{uc};0;{cs};1_",
+        vk = vk, sc = sc, uc = uc, cs = cs
+    )
+}
+
+/// Map a named key to a win32-input-mode record. ENHANCED_KEY (0x0100) flags the
+/// arrow keys. Returns None for keys we don't special-case.
+fn key_w32(key: &str) -> Option<String> {
+    const ENH: u32 = 0x0100;
+    let (vk, sc, uc, cs) = match key {
+        "Enter" => (0x0D, 0x1C, 0x0D, 0),
+        "Down" => (0x28, 0x50, 0, ENH),
+        "Up" => (0x26, 0x48, 0, ENH),
+        "Left" => (0x25, 0x4B, 0, ENH),
+        "Right" => (0x27, 0x4D, 0, ENH),
+        "Esc" => (0x1B, 0x01, 0x1B, 0),
+        "Tab" => (0x09, 0x0F, 0x09, 0),
+        "Space" => (0x20, 0x39, 0x20, 0),
+        _ => return None,
+    };
+    Some(w32_record(vk, sc, uc, cs))
+}
+
 impl Session {
+    fn win32_active(&self) -> bool {
+        self.win32.load(Ordering::Relaxed)
+    }
+
     pub fn spawn(
         name: String,
         exe: &str,
@@ -104,19 +139,41 @@ impl Session {
         let screen = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
         let (output_tx, _) = broadcast::channel::<Vec<u8>>(512);
         let mut reader = pair.master.try_clone_reader()?;
+        let win32 = Arc::new(AtomicBool::new(false));
         {
             let s = screen.clone();
             let tee = output_tx.clone();
+            let win32_r = win32.clone();
+            // Diagnostic: dump raw PTY output to a file when LIT_BRIDGE_RS_RAWLOG is set.
+            // Inert in production; used to inspect the CLI's terminal-capability handshake.
+            let raw_log = std::env::var("LIT_BRIDGE_RS_RAWLOG").ok();
             thread::spawn(move || {
+                use std::io::Write as _;
+                let mut log = raw_log.as_ref().and_then(|p| {
+                    std::fs::OpenOptions::new().create(true).append(true).open(p).ok()
+                });
                 let mut buf = [0u8; 8192];
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            if let Ok(mut g) = s.lock() {
-                                g.process(&buf[..n]);
+                            let chunk = &buf[..n];
+                            // Track the CLI's win32-input-mode negotiation so input is
+                            // encoded correctly (Windows interactive TUI).
+                            if chunk.windows(8).any(|w| w == b"\x1b[?9001h") {
+                                win32_r.store(true, Ordering::Relaxed);
                             }
-                            let _ = tee.send(buf[..n].to_vec()); // feed terminal-attach clients
+                            if chunk.windows(8).any(|w| w == b"\x1b[?9001l") {
+                                win32_r.store(false, Ordering::Relaxed);
+                            }
+                            if let Some(f) = log.as_mut() {
+                                let _ = f.write_all(chunk);
+                                let _ = f.flush();
+                            }
+                            if let Ok(mut g) = s.lock() {
+                                g.process(chunk);
+                            }
+                            let _ = tee.send(chunk.to_vec()); // feed terminal-attach clients
                         }
                         Err(_) => break,
                     }
@@ -147,6 +204,7 @@ impl Session {
             model: None,
             jsonl,
             writer,
+            win32,
             screen,
             output_tx,
             _master: pair.master,
@@ -204,6 +262,20 @@ impl Session {
     /// too eagerly on a longer message gets absorbed and the message is left
     /// unsubmitted in the input box. Mirrors tmux paste-buffer then send-keys Enter.
     pub fn send_text(&mut self, text: &str) -> Result<()> {
+        if self.win32_active() {
+            // The CLI ignores raw bytes in win32-input-mode; encode each char.
+            let mut out = String::new();
+            for ch in text.chars() {
+                if ch == '\r' || ch == '\n' {
+                    out.push_str(&key_w32("Enter").unwrap());
+                } else {
+                    out.push_str(&w32_record(0, 0, ch as u32, 0));
+                }
+            }
+            self.writer.write_all(out.as_bytes())?;
+            self.writer.flush()?;
+            return Ok(());
+        }
         self.writer.write_all(text.as_bytes())?;
         self.writer.flush()?;
         Ok(())
@@ -211,6 +283,11 @@ impl Session {
 
     /// Submit the current input line.
     pub fn send_enter(&mut self) -> Result<()> {
+        if self.win32_active() {
+            self.writer.write_all(key_w32("Enter").unwrap().as_bytes())?;
+            self.writer.flush()?;
+            return Ok(());
+        }
         self.writer.write_all(b"\r")?;
         self.writer.flush()?;
         Ok(())
@@ -239,6 +316,13 @@ impl Session {
 
     /// Send a named key (for dialogs / navigation).
     pub fn send_key(&mut self, key: &str) -> Result<()> {
+        if self.win32_active() {
+            if let Some(rec) = key_w32(key) {
+                self.writer.write_all(rec.as_bytes())?;
+                self.writer.flush()?;
+                return Ok(());
+            }
+        }
         let seq = match key {
             "Enter" => "\r",
             "Down" => "\x1b[B",
