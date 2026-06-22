@@ -15,10 +15,16 @@ use serde_json::{json, Value};
 const RESULT_MAX: usize = 5000;
 
 /// Derive Claude Code's project dir from a working directory (and optional config dir).
-/// Mirrors `cc_project_dir` in the Python watcher exactly.
+///
+/// Claude's slug is every non-alphanumeric char of the absolute path mapped to `-`.
+/// On Unix the leading `/` becomes a leading `-` (e.g. `/opt/x` -> `-opt-x`). On
+/// Windows the path starts with a drive letter, so there is NO leading dash
+/// (e.g. `C:\Users\ben\x` -> `C--Users-ben-x`). Do not trim a leading separator or
+/// re-prepend `-` — that produced a spurious leading dash on Windows
+/// (`-C--Users-...`), so the JSONL transcript was never found and `complete` never
+/// fired even though Claude had responded.
 pub fn cc_project_dir(working_dir: &str, config_dir: Option<&str>) -> PathBuf {
     let slug: String = working_dir
-        .trim_start_matches('/')
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
@@ -29,7 +35,7 @@ pub fn cc_project_dir(working_dir: &str, config_dir: Option<&str>) -> PathBuf {
             PathBuf::from(home).join(".claude")
         }
     };
-    base.join("projects").join(format!("-{slug}"))
+    base.join("projects").join(slug)
 }
 
 pub struct JsonlWatcher {
@@ -448,3 +454,22 @@ fn truncate_chars(s: &str, max: usize) -> String {
 // Allow Path comparison helper used above without extra imports.
 #[allow(dead_code)]
 fn _path_marker(_: &Path) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_slug_unix_and_windows() {
+        // Unix: leading `/` becomes a leading `-`.
+        assert_eq!(
+            cc_project_dir("/opt/lit-platform", Some("/cfg")).file_name().unwrap(),
+            "-opt-lit-platform"
+        );
+        // Windows: drive-letter path → no leading dash (matches Claude's own slug).
+        assert_eq!(
+            cc_project_dir(r"C:\Users\ben\lbrs-e2e2", Some("/cfg")).file_name().unwrap(),
+            "C--Users-ben-lbrs-e2e2"
+        );
+    }
+}
