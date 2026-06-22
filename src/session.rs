@@ -322,6 +322,17 @@ impl Session {
                 self.writer.flush()?;
                 return Ok(());
             }
+            // Not a named key. If it's a single printable char (e.g. a digit for
+            // dialog quick-select), encode it as a win32 text record — the CLI
+            // ignores raw bytes in win32-input-mode, so this is the only way it
+            // registers under a headless ConPTY.
+            if key.chars().count() == 1 {
+                let ch = key.chars().next().unwrap();
+                let rec = w32_record(0, 0, ch as u32, 0);
+                self.writer.write_all(rec.as_bytes())?;
+                self.writer.flush()?;
+                return Ok(());
+            }
         }
         let seq = match key {
             "Enter" => "\r",

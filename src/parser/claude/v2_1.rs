@@ -15,7 +15,10 @@ use crate::parser::{SessionState, TuiContentBlock, TuiMessage, TuiParser, TuiSta
 /// Startup dialogs: (detect-substring, dismiss-keys, name)
 const STARTUP_DIALOGS: &[(&str, &[&str], &str)] = &[
     ("Select login method", &["Enter"], "login-method"),
-    ("Yes, I accept", &["Down", "Enter"], "bypass-permissions"),
+    // Quick-select "2. Yes, I accept". The arrow-key win32 record (ENHANCED_KEY)
+    // does NOT dismiss this dialog under a headless ConPTY; the digit (sent as a
+    // win32 text record) does. See send_key's single-char fallback.
+    ("Yes, I accept", &["2"], "bypass-permissions"),
     ("Choose the text style", &["Enter"], "theme-selection"),
     ("enable auto mode", &["Enter"], "auto-mode"),
     ("Do you trust", &["Enter"], "workspace-trust"),
