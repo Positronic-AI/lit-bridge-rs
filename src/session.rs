@@ -263,27 +263,28 @@ impl Session {
     /// unsubmitted in the input box. Mirrors tmux paste-buffer then send-keys Enter.
     pub fn send_text(&mut self, text: &str) -> Result<()> {
         if self.win32_active() {
-            // The CLI ignores raw bytes in win32-input-mode; encode each char.
-            // Newlines inside the message body must be INSERTED, not submitted:
-            // a bare Enter submits in the TUI, so encoding each `\n` as Enter
-            // fragments a multi-line message (every newline fires a submit) and
-            // leaves the tail sitting unsubmitted in the input box. Ctrl+J is the
-            // TUI's portable "insert newline" binding (works in any terminal,
-            // incl. under win32-input-mode); Shift+Enter is terminal-dependent
-            // and submitted here. Encode Ctrl+J as VK_J + LEFT_CTRL, Uc=LF. The
-            // single real submit is the separate send_enter() the caller issues.
-            const LCTRL: u32 = 0x0008;
-            let mut out = String::new();
+            // Multi-line input via per-key records is unreliable under ConPTY:
+            // a bare Enter submits, and Ctrl+J / Shift+Enter are racy (sometimes
+            // insert, sometimes submit-per-line) — so a multi-line message gets
+            // fragmented and the tail is left unsubmitted in the input box.
+            //
+            // Use BRACKETED PASTE instead. Claude enables it at startup
+            // (ESC[?2004h); content wrapped in ESC[200~ … ESC[201~ is treated as
+            // literal pasted text — newlines inserted, nothing submitted. Paste
+            // is delivered as raw bracketed sequences even under win32-input-mode
+            // (the mode changes keyboard-key encoding, not paste), so the raw
+            // bytes are honored. The single submit is the caller's send_enter().
+            let mut out: Vec<u8> = Vec::new();
+            out.extend_from_slice(b"\x1b[200~");
             for ch in text.chars() {
-                if ch == '\n' {
-                    out.push_str(&w32_record(0x4A, 0x24, 0x0A, LCTRL)); // Ctrl+J
-                } else if ch == '\r' {
-                    continue; // drop bare CR (CRLF handled by the \n)
-                } else {
-                    out.push_str(&w32_record(0, 0, ch as u32, 0));
+                if ch == '\r' {
+                    continue; // normalize CRLF -> LF
                 }
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
             }
-            self.writer.write_all(out.as_bytes())?;
+            out.extend_from_slice(b"\x1b[201~");
+            self.writer.write_all(&out)?;
             self.writer.flush()?;
             return Ok(());
         }
