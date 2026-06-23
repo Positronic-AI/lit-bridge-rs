@@ -436,23 +436,23 @@ impl Monitor {
                 }));
                 s.state = new_state;
             }
-            // Submit-with-verification. Only press Enter once the pasted text has
-            // fully landed — i.e. the screen has been STABLE for a moment — so the
-            // Enter never races mid-paste (which fragmented the message). Don't
-            // clear on a brief render flicker; require the turn to have genuinely
-            // started (non-idle past a grace period). Retry while idle+settled.
+            // Submit-with-verification. The bracketed paste lands the full message
+            // in the prompt within a few hundred ms; then press Enter while idle
+            // (retry, spaced out) until the turn starts. Do NOT gate on screen
+            // "settle" — the idle prompt has a blinking cursor so the capture never
+            // stops changing, which previously blocked the Enter entirely. Only
+            // treat non-idle as "submitted" AFTER we've actually pressed Enter, so
+            // the paste-render flicker can't clear the flag before we submit.
             if let Some(pasted_at) = s.pending_submit {
-                let settled = s.last_change.elapsed() > Duration::from_millis(500);
-                if new_state != SessionState::Idle && pasted_at.elapsed() > Duration::from_millis(900) {
-                    s.pending_submit = None; // turn started — submitted
-                } else if pasted_at.elapsed() > Duration::from_secs(12) {
+                if pasted_at.elapsed() > Duration::from_secs(12) {
                     s.pending_submit = None; // give up
+                } else if new_state != SessionState::Idle && s.last_submit_try.is_some() {
+                    s.pending_submit = None; // turn started — submitted
                 } else if new_state == SessionState::Idle
-                    && settled
-                    && pasted_at.elapsed() > Duration::from_millis(500)
+                    && pasted_at.elapsed() > Duration::from_millis(600)
                     && s
                         .last_submit_try
-                        .map_or(true, |t| t.elapsed() > Duration::from_millis(900))
+                        .map_or(true, |t| t.elapsed() > Duration::from_millis(800))
                 {
                     let _ = s.send_enter();
                     s.last_submit_try = Some(Instant::now());
