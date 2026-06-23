@@ -304,17 +304,10 @@ impl Monitor {
             }
             Err(msg) => self.emit(json!({"session": key, "event": "error", "message": msg})).await,
         }
-        // Arm submit-with-verification: the poll loop presses Enter while the
-        // prompt stays idle (the pasted text sits in the box) and clears the flag
-        // once the turn starts. A single timed Enter raced the paste ingestion
-        // under ConPTY and landed nondeterministically (text left unsubmitted, or
-        // a fragment submitted). Polling-and-retrying makes submission reliable.
-        if sent_ok {
-            if let Some(s) = self.sessions.get_mut(&key) {
-                s.pending_submit = Some(Instant::now());
-                s.last_submit_try = None;
-            }
-        }
+        // Submission is handled atomically inside send_text (bracketed paste
+        // immediately followed by the Enter record), so no separate/poll-loop
+        // Enter is armed here — that raced the paste and was unreliable.
+        let _ = sent_ok;
     }
 
     /// Send text + Enter WITHOUT starting an observed turn — for slash commands

@@ -282,7 +282,12 @@ impl Session {
             // literal pasted text — newlines inserted, nothing submitted. Paste
             // is delivered as raw bracketed sequences even under win32-input-mode
             // (the mode changes keyboard-key encoding, not paste), so the raw
-            // bytes are honored. The single submit is the caller's send_enter().
+            // bytes are honored.
+            //
+            // Submit in the SAME atomic write (paste-end marker immediately
+            // followed by an Enter key record), mirroring a real terminal's
+            // paste-then-Enter. A separately-sent Enter (delayed, or from the poll
+            // loop) raced the paste and didn't submit reliably under ConPTY.
             let mut out: Vec<u8> = Vec::new();
             out.extend_from_slice(b"\x1b[200~");
             for ch in text.chars() {
@@ -293,6 +298,7 @@ impl Session {
                 out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
             }
             out.extend_from_slice(b"\x1b[201~");
+            out.extend_from_slice(key_w32("Enter").unwrap().as_bytes());
             self.writer.write_all(&out)?;
             self.writer.flush()?;
             return Ok(());
