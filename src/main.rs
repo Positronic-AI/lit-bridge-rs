@@ -436,19 +436,23 @@ impl Monitor {
                 }));
                 s.state = new_state;
             }
-            // Submit-with-verification: while a freshly-pasted message sits in an
-            // idle prompt, press Enter (spaced out) until the turn starts; clear
-            // the flag once the prompt leaves idle. Robust against the paste/Enter
-            // race under ConPTY that left a single timed Enter landing flakily.
+            // Submit-with-verification. Only press Enter once the pasted text has
+            // fully landed — i.e. the screen has been STABLE for a moment — so the
+            // Enter never races mid-paste (which fragmented the message). Don't
+            // clear on a brief render flicker; require the turn to have genuinely
+            // started (non-idle past a grace period). Retry while idle+settled.
             if let Some(pasted_at) = s.pending_submit {
-                if new_state != SessionState::Idle {
+                let settled = s.last_change.elapsed() > Duration::from_millis(500);
+                if new_state != SessionState::Idle && pasted_at.elapsed() > Duration::from_millis(900) {
                     s.pending_submit = None; // turn started — submitted
-                } else if pasted_at.elapsed() > Duration::from_secs(10) {
+                } else if pasted_at.elapsed() > Duration::from_secs(12) {
                     s.pending_submit = None; // give up
-                } else if pasted_at.elapsed() > Duration::from_millis(400)
+                } else if new_state == SessionState::Idle
+                    && settled
+                    && pasted_at.elapsed() > Duration::from_millis(500)
                     && s
                         .last_submit_try
-                        .map_or(true, |t| t.elapsed() > Duration::from_millis(500))
+                        .map_or(true, |t| t.elapsed() > Duration::from_millis(900))
                 {
                     let _ = s.send_enter();
                     s.last_submit_try = Some(Instant::now());
