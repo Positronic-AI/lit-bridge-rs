@@ -279,11 +279,20 @@ impl Monitor {
             Some(s) => {
                 s.baseline_msgs = baseline;
                 s.observing = true;
-                s.last_streamed.clear();
+                s.prev_final = std::mem::take(&mut s.last_streamed);
                 s.sent = content.clone();
                 s.begin_turn(); // reset quiescence clocks + position the JSONL watcher
                 match s.send_text(&content) {
                     Ok(()) => {
+                        // On win32 the Enter is written atomically inside send_text.
+                        // Everywhere else (Linux/tmux PTY) send_text writes only the
+                        // text — arm the poll loop to press Enter until the turn
+                        // starts. Without this the message sits unsubmitted in the
+                        // prompt (regression from b3dbb9b).
+                        if !s.win32_active() {
+                            s.pending_submit = Some(Instant::now());
+                            s.last_submit_try = None;
+                        }
                         let old = s.state;
                         s.state = SessionState::Thinking;
                         Ok(old)
@@ -304,9 +313,9 @@ impl Monitor {
             }
             Err(msg) => self.emit(json!({"session": key, "event": "error", "message": msg})).await,
         }
-        // Submission is handled atomically inside send_text (bracketed paste
-        // immediately followed by the Enter record), so no separate/poll-loop
-        // Enter is armed here — that raced the paste and was unreliable.
+        // win32: submission is handled atomically inside send_text (bracketed
+        // paste immediately followed by the Enter record). Non-win32: the poll
+        // loop submits (armed above) since send_text writes text only.
         let _ = sent_ok;
     }
 
@@ -484,24 +493,51 @@ impl Monitor {
                 // structured tool_use (the interactive question) the frontend renders from
                 // JSONL. So suppress the scrape in Dialog state and let the question show.
                 if s.observing && new_state != SessionState::Dialog {
-                    let resp =
-                        self.parser
-                            .extract_raw_response(s.baseline_msgs, &cap, Some(&s.sent), 0);
-                    if !resp.is_empty() && resp != s.last_streamed {
-                        // Skip only a genuine flicker frame — a mid-redraw scrape
-                        // that briefly COLLAPSES to a fraction of the content.
-                        // The previous guard skipped any frame that lost the
-                        // response bullet `●`; but on a long response the bullet
-                        // scrolls off the top of the visible screen and never
-                        // returns, so every later frame was skipped and the live
-                        // stream FROZE (webapp stuck on a stale partial + blinking
-                        // cursor until the JSONL `complete` landed seconds later).
-                        let collapsed = resp.len() * 2 < s.last_streamed.len();
-                        if !collapsed {
-                            events.push(json!({
-                                "session": s.name.clone(), "event": "replace", "text": resp.clone()
-                            }));
-                            s.last_streamed = resp;
+                    // DURABLE STALE-FRAME GATE: the JSONL transcript is authoritative for
+                    // "has this turn actually started?". `jsonl_turn_open()` flips true only
+                    // once the NEW user message lands in the transcript — which is also the
+                    // moment Claude Code has echoed `sent` to the TUI, making the scrape
+                    // anchor (`Some(&s.sent)`) reliable. BEFORE that, the TUI can still show
+                    // the PRIOR turn's settled response (the sent message hasn't echoed yet),
+                    // so `extract_raw_response` falls back to the last bullet and streams the
+                    // previous response into the new bubble — the "previous response appears
+                    // first, then swaps" bug. While the turn isn't yet open (or we're still in
+                    // the pre-body think-gap), relay ONLY the spinner, never a scrape.
+                    let turn_started = s.jsonl_turn_open();
+                    if !turn_started
+                        || (new_state == SessionState::Thinking && s.last_streamed.is_empty())
+                    {
+                        // Relay the live spinner line so the web shows the SAME shimmer as
+                        // the terminal — never the stale previous response. Gated to before
+                        // any body has streamed this turn; once the response starts, mid-turn
+                        // tool gaps keep the streamed body in place.
+                        if let Some(spin) = self.parser.extract_spinner_line(&cap) {
+                            if s.last_thinking.as_deref() != Some(spin.as_str()) {
+                                events.push(json!({
+                                    "session": s.name.clone(), "event": "thinking", "text": spin.clone()
+                                }));
+                                s.last_thinking = Some(spin);
+                            }
+                        }
+                    } else {
+                        // Stream the response text live from the TUI scrape; the clean
+                        // JSONL `complete` swaps in at turn-end. Skip only a genuine
+                        // flicker frame — a mid-redraw scrape that briefly COLLAPSES to
+                        // a fraction of the content. (We can't gate on the response
+                        // bullet `●`: on a long response it scrolls off the top of the
+                        // visible screen and never returns, which would freeze the
+                        // stream on a stale partial.)
+                        let resp =
+                            self.parser
+                                .extract_raw_response(s.baseline_msgs, &cap, Some(&s.sent), 0);
+                        if !resp.is_empty() && resp != s.last_streamed && resp != s.prev_final {
+                            let collapsed = resp.len() * 2 < s.last_streamed.len();
+                            if !collapsed {
+                                events.push(json!({
+                                    "session": s.name.clone(), "event": "replace", "text": resp.clone()
+                                }));
+                                s.last_streamed = resp;
+                            }
                         }
                     }
                 }

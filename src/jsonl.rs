@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde_json::{json, Value};
 
@@ -58,6 +59,13 @@ pub struct JsonlWatcher {
     /// cursor) and the bridge stops observing, dropping the real text. So we defer:
     /// hold the turn open and complete once the text actually arrives.
     pending_complete: bool,
+    /// Wall-clock moment `begin_turn` pinned the active transcript. A conversation
+    /// transcript whose BIRTH time is after this was created during the turn — i.e.
+    /// a mid-turn session roll (a `[resumed]` session spins up a fresh transcript and
+    /// writes the response there, leaving the pinned file silent). Such a file cannot
+    /// hold stale history for this turn, so it is the one cross-file switch `poll`
+    /// may safely make. `None` until the first `begin_turn`.
+    pin_time: Option<SystemTime>,
 }
 
 impl JsonlWatcher {
@@ -70,6 +78,7 @@ impl JsonlWatcher {
             turn_text_parts: Vec::new(),
             open: false,
             pending_complete: false,
+            pin_time: None,
         };
         // Start at EOF of the active transcript so we only see NEW entries.
         if let Some(f) = w.find_active_jsonl() {
@@ -113,6 +122,41 @@ impl JsonlWatcher {
         cands.into_iter().next().map(|(_, p)| p) // fallback: newest overall
     }
 
+    /// Detect a mid-turn session roll: the response is being written to a transcript
+    /// that did not exist when this turn was pinned. Returns the roll target, or
+    /// `None` if there isn't one.
+    ///
+    /// The discriminator is BIRTH time, not mtime. `poll`'s anti-flap guard exists to
+    /// stop re-reading a *pre-existing* newer file from offset 0 and replaying its
+    /// historical `end_turn` (the channel-turns-2+ replay bug). A file BORN after the
+    /// pin can't carry that hazard — it holds only this turn — so switching to it is
+    /// the one safe cross-file move. We require `created() > pin_time`; if birth time
+    /// is unavailable we skip the file rather than guess, preserving the safe default.
+    fn find_rolled_transcript(&self) -> Option<PathBuf> {
+        let pin_time = self.pin_time?;
+        let cur = self.file.as_ref();
+        let mut best: Option<(SystemTime, PathBuf)> = None;
+        for entry in fs::read_dir(&self.project_dir).ok()?.flatten() {
+            let p = entry.path();
+            if p.extension().map(|e| e == "jsonl").unwrap_or(false) {
+                if Some(&p) == cur {
+                    continue;
+                }
+                // Must be provably born AFTER the pin — otherwise leave it alone.
+                let born = match entry.metadata().and_then(|m| m.created()) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                if born > pin_time && is_conversation_transcript(&p) {
+                    if best.as_ref().map(|(t, _)| born > *t).unwrap_or(true) {
+                        best = Some((born, p));
+                    }
+                }
+            }
+        }
+        best.map(|(_, p)| p)
+    }
+
     /// Call when a new send starts — find/reset the active transcript at its current EOF.
     pub fn begin_turn(&mut self) {
         self.file = self.find_active_jsonl();
@@ -122,6 +166,9 @@ impl JsonlWatcher {
             .and_then(|f| fs::metadata(f).ok())
             .map(|m| m.len())
             .unwrap_or(0);
+        // Stamp the pin moment so poll() can recognise a transcript born mid-turn
+        // (a session roll) and distinguish it from a pre-existing newer file.
+        self.pin_time = Some(SystemTime::now());
         // Record exactly which transcript got pinned (and at what offset) so a turn
         // whose JSONL completion never fires can be traced to a stale/wrong-file pin
         // vs a mid-turn session roll — without this, the watcher is a black box.
@@ -196,12 +243,33 @@ impl JsonlWatcher {
             // newest — so switching mid-turn re-read the whole file from the start,
             // replaying historical tool_results and a STALE `end_turn`. That fired a
             // spurious turn_complete and ended the turn before the real response was
-            // ever written (channel turns 2+ silently lost). The file is pinned by
-            // begin_turn for the whole turn; a genuine new-session roll re-anchors
-            // through begin_turn on the next send, and the TUI quiescence fallback
-            // still closes a turn if a transcript ever rolls mid-flight — slower,
-            // never shorter, never replayed.
-            return Vec::new();
+            // ever written (channel turns 2+ silently lost).
+            //
+            // The ONE exception: a genuine mid-turn session roll. A `[resumed]`
+            // session spins up a BRAND-NEW transcript and writes the response there,
+            // leaving the pinned file silent forever — the turn goes dark and only
+            // closes via the slow TUI quiescence fallback (stuck blinking cursor).
+            // `find_rolled_transcript` returns a file ONLY if it was born after this
+            // turn's pin, which means it cannot replay historical entries — so it is
+            // safe to re-anchor onto it from offset 0 and read the real response.
+            if let Some(rolled) = self.find_rolled_transcript() {
+                crate::diag::log(
+                    "ROLL",
+                    &format!(
+                        "from={} to={}",
+                        self.file
+                            .as_ref()
+                            .map(|f| f.display().to_string())
+                            .unwrap_or_else(|| "<none>".into()),
+                        rolled.display()
+                    ),
+                );
+                self.file = Some(rolled);
+                self.pos = 0;
+                // Fall through: read the rolled file from the start this same poll.
+            } else {
+                return Vec::new();
+            }
         }
 
         let new_data = match self.read_new() {

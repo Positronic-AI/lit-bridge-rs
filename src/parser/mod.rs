@@ -99,6 +99,12 @@ pub trait TuiParser {
         baseline_completions: usize,
     ) -> String;
 
+    /// The active spinner/status line shown during a think-gap — e.g.
+    /// `✽ Thinking… (esc to interrupt · 3s · ↑ 1.2k tokens)` — returned raw so the
+    /// web can render the SAME shimmer as the terminal. `None` when no in-progress
+    /// spinner is on screen (i.e. the response has started or the turn is done).
+    fn extract_spinner_line(&self, capture: &str) -> Option<String>;
+
     /// True when the in-flight turn has produced a completion marker after the prompt.
     fn turn_complete(&self, capture: &str) -> bool;
 

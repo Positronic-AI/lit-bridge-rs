@@ -32,3 +32,34 @@ fn parser_matches_python_oracle() {
         assert_eq!(count, *exp_count, "assistant count mismatch for {file}");
     }
 }
+
+/// The think-gap relay: during `thinking` the spinner line is returned (web shows the
+/// same shimmer as the terminal); during `responding` it is `None` (we stream the body
+/// instead, never a stale spinner). Guards the duplicate-of-last-message regression.
+#[test]
+fn spinner_line_only_during_think_gap() {
+    let parser = select_parser("claude-code").expect("claude-code parser");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+
+    let thinking = String::from_utf8_lossy(
+        &std::fs::read(dir.join("claude_2.1.x_thinking.txt")).expect("thinking fixture"),
+    )
+    .into_owned();
+    let spin = parser
+        .extract_spinner_line(&thinking)
+        .expect("spinner line present while thinking");
+    assert!(
+        spin.contains("Thinking") && spin.contains('…'),
+        "expected the active spinner verb line, got {spin:?}"
+    );
+
+    let responding = String::from_utf8_lossy(
+        &std::fs::read(dir.join("claude_2.1.x_responding.txt")).expect("responding fixture"),
+    )
+    .into_owned();
+    assert_eq!(
+        parser.extract_spinner_line(&responding),
+        None,
+        "must not relay a spinner once the response is rendering"
+    );
+}

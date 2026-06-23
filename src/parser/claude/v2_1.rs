@@ -204,6 +204,32 @@ impl TuiParser for ClaudeV21Parser {
         SessionState::Idle
     }
 
+    fn extract_spinner_line(&self, capture: &str) -> Option<String> {
+        // Scan from the bottom for the active spinner verb line (`✽ Thinking…`),
+        // skipping trailing chrome (blank lines, separators, `⏵`/`▸` mode &
+        // `esc to interrupt` status lines, the compact bar, the conversation picker,
+        // and the `❯` prompt). If we reach real content (a response bullet `●` or a
+        // `✻` completion marker) before finding a spinner, the turn has already
+        // produced output — not a think-gap — so return None.
+        for line in capture.split('\n').rev() {
+            let s = line.trim();
+            if s.is_empty()
+                || self.re_separator.is_match(s)
+                || self.re_status.is_match(s)
+                || self.re_compact_progress.is_match(s)
+                || self.re_conversation_picker.is_match(s)
+                || s.starts_with('❯')
+            {
+                continue;
+            }
+            if self.re_spinner_active.is_match(s) {
+                return Some(s.to_string());
+            }
+            return None;
+        }
+        None
+    }
+
     fn count_assistant_messages(&self, capture: &str) -> usize {
         capture
             .split('\n')

@@ -41,6 +41,17 @@ pub struct Session {
     pub last_submit_try: Option<Instant>,
     /// Last TUI-scraped response text emitted as a streaming `replace` (dedup).
     pub last_streamed: String,
+    /// The previous turn's final scraped response, captured when `last_streamed`
+    /// is wiped at `send`. The first post-send scrape often still shows the prior
+    /// response (the TUI hasn't redrawn yet), and with `last_streamed` cleared it
+    /// would pass the dedup and stream as a stale "duplicate-of-last-message"
+    /// opening frame. We suppress emitting any `replace` equal to this until real
+    /// new content diverges. Kept separate from `last_streamed` so the think-gap
+    /// shimmer branch (which keys on `last_streamed.is_empty()`) still fires.
+    pub prev_final: String,
+    /// Last spinner line relayed as a `thinking` event during the think-gap (dedup —
+    /// a ticking timer re-emits, but identical frames don't). Cleared each turn.
+    pub last_thinking: Option<String>,
     /// The CLI model this session launched with (from --model), for model-switch logic.
     pub model: Option<String>,
     /// Watches Claude Code's JSONL transcript for clean content + tool events.
@@ -85,7 +96,7 @@ fn key_w32(key: &str) -> Option<String> {
 }
 
 impl Session {
-    fn win32_active(&self) -> bool {
+    pub fn win32_active(&self) -> bool {
         self.win32.load(Ordering::Relaxed)
     }
 
@@ -210,6 +221,8 @@ impl Session {
             pending_submit: None,
             last_submit_try: None,
             last_streamed: String::new(),
+            prev_final: String::new(),
+            last_thinking: None,
             model: None,
             jsonl,
             writer,
@@ -326,6 +339,7 @@ impl Session {
         let now = Instant::now();
         self.turn_started = now;
         self.last_change = now;
+        self.last_thinking = None;
         if let Some(j) = &mut self.jsonl {
             j.begin_turn();
         }
