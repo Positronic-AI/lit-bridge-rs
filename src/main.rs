@@ -488,9 +488,16 @@ impl Monitor {
                         self.parser
                             .extract_raw_response(s.baseline_msgs, &cap, Some(&s.sent), 0);
                     if !resp.is_empty() && resp != s.last_streamed {
-                        let had = s.last_streamed.lines().any(|l| l.trim_start().starts_with('●'));
-                        let has = resp.lines().any(|l| l.trim_start().starts_with('●'));
-                        if !(had && !has) {
+                        // Skip only a genuine flicker frame — a mid-redraw scrape
+                        // that briefly COLLAPSES to a fraction of the content.
+                        // The previous guard skipped any frame that lost the
+                        // response bullet `●`; but on a long response the bullet
+                        // scrolls off the top of the visible screen and never
+                        // returns, so every later frame was skipped and the live
+                        // stream FROZE (webapp stuck on a stale partial + blinking
+                        // cursor until the JSONL `complete` landed seconds later).
+                        let collapsed = resp.len() * 2 < s.last_streamed.len();
+                        if !collapsed {
                             events.push(json!({
                                 "session": s.name.clone(), "event": "replace", "text": resp.clone()
                             }));
