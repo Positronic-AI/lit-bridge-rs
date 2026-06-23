@@ -304,14 +304,18 @@ impl Monitor {
             }
             Err(msg) => self.emit(json!({"session": key, "event": "error", "message": msg})).await,
         }
-        // Submit after a brief pause so Claude finishes ingesting the pasted text before
-        // the Enter (avoids the \r racing the paste). Done in a BACKGROUND task so the
+        // Submit after a pause so Claude finishes ingesting the typed text before
+        // the Enter (avoids the \r racing the input). The pause scales with the
+        // message length: a multi-line message is many more input records, and a
+        // fixed short delay let the Enter land before ingestion finished — the
+        // text stayed in the box unsubmitted. Done in a BACKGROUND task so the
         // command loop isn't blocked across the wait.
         if sent_ok {
             let mon2 = mon.clone();
             let key2 = key.clone();
+            let submit_delay = 250 + (content.chars().count() as u64).saturating_mul(3).min(4000);
             tokio::task::spawn_local(async move {
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                tokio::time::sleep(Duration::from_millis(submit_delay)).await;
                 let mut m = mon2.lock().await;
                 if let Some(s) = m.sessions.get_mut(&key2) {
                     let _ = s.send_enter();
