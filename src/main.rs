@@ -304,23 +304,16 @@ impl Monitor {
             }
             Err(msg) => self.emit(json!({"session": key, "event": "error", "message": msg})).await,
         }
-        // Submit after a pause so Claude finishes ingesting the typed text before
-        // the Enter (avoids the \r racing the input). The pause scales with the
-        // message length: a multi-line message is many more input records, and a
-        // fixed short delay let the Enter land before ingestion finished — the
-        // text stayed in the box unsubmitted. Done in a BACKGROUND task so the
-        // command loop isn't blocked across the wait.
+        // Arm submit-with-verification: the poll loop presses Enter while the
+        // prompt stays idle (the pasted text sits in the box) and clears the flag
+        // once the turn starts. A single timed Enter raced the paste ingestion
+        // under ConPTY and landed nondeterministically (text left unsubmitted, or
+        // a fragment submitted). Polling-and-retrying makes submission reliable.
         if sent_ok {
-            let mon2 = mon.clone();
-            let key2 = key.clone();
-            let submit_delay = 250 + (content.chars().count() as u64).saturating_mul(3).min(4000);
-            tokio::task::spawn_local(async move {
-                tokio::time::sleep(Duration::from_millis(submit_delay)).await;
-                let mut m = mon2.lock().await;
-                if let Some(s) = m.sessions.get_mut(&key2) {
-                    let _ = s.send_enter();
-                }
-            });
+            if let Some(s) = self.sessions.get_mut(&key) {
+                s.pending_submit = Some(Instant::now());
+                s.last_submit_try = None;
+            }
         }
     }
 
@@ -442,6 +435,24 @@ impl Monitor {
                     "to": new_state.as_str()
                 }));
                 s.state = new_state;
+            }
+            // Submit-with-verification: while a freshly-pasted message sits in an
+            // idle prompt, press Enter (spaced out) until the turn starts; clear
+            // the flag once the prompt leaves idle. Robust against the paste/Enter
+            // race under ConPTY that left a single timed Enter landing flakily.
+            if let Some(pasted_at) = s.pending_submit {
+                if new_state != SessionState::Idle {
+                    s.pending_submit = None; // turn started — submitted
+                } else if pasted_at.elapsed() > Duration::from_secs(10) {
+                    s.pending_submit = None; // give up
+                } else if pasted_at.elapsed() > Duration::from_millis(400)
+                    && s
+                        .last_submit_try
+                        .map_or(true, |t| t.elapsed() > Duration::from_millis(500))
+                {
+                    let _ = s.send_enter();
+                    s.last_submit_try = Some(Instant::now());
+                }
             }
             if s.observing {
                 // AUTHORITATIVE completion path: the JSONL transcript. `turn_complete`

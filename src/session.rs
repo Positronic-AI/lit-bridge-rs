@@ -32,6 +32,13 @@ pub struct Session {
     pub turn_started: Instant,
     /// The text of the in-flight user message (needle for extraction).
     pub sent: String,
+    /// Set when a message has been typed/pasted into the prompt and is awaiting
+    /// submission. The poll loop presses Enter while the prompt stays idle and
+    /// clears this once the turn starts — robust against the paste/Enter race
+    /// under ConPTY (a single timed Enter landed nondeterministically).
+    pub pending_submit: Option<Instant>,
+    /// Wall-clock of the last submit-Enter attempt (to space out retries).
+    pub last_submit_try: Option<Instant>,
     /// Last TUI-scraped response text emitted as a streaming `replace` (dedup).
     pub last_streamed: String,
     /// The CLI model this session launched with (from --model), for model-switch logic.
@@ -200,6 +207,8 @@ impl Session {
             last_change: Instant::now(),
             turn_started: Instant::now(),
             sent: String::new(),
+            pending_submit: None,
+            last_submit_try: None,
             last_streamed: String::new(),
             model: None,
             jsonl,
