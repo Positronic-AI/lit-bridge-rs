@@ -264,10 +264,19 @@ impl Session {
     pub fn send_text(&mut self, text: &str) -> Result<()> {
         if self.win32_active() {
             // The CLI ignores raw bytes in win32-input-mode; encode each char.
+            // Newlines inside the message body must be INSERTED, not submitted:
+            // a bare Enter submits in the TUI, so encoding each `\n` as Enter
+            // fragments a multi-line message (every newline fires a submit) and
+            // leaves the tail sitting unsubmitted in the input box. Use
+            // Shift+Enter (SHIFT_PRESSED) to insert a newline; the single real
+            // submit is the separate send_enter() the caller issues afterward.
+            const SHIFT: u32 = 0x0010;
             let mut out = String::new();
             for ch in text.chars() {
-                if ch == '\r' || ch == '\n' {
-                    out.push_str(&key_w32("Enter").unwrap());
+                if ch == '\n' {
+                    out.push_str(&w32_record(0x0D, 0x1C, 0x0D, SHIFT));
+                } else if ch == '\r' {
+                    continue; // drop bare CR (CRLF handled by the \n)
                 } else {
                     out.push_str(&w32_record(0, 0, ch as u32, 0));
                 }
