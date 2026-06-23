@@ -503,9 +503,19 @@ impl Monitor {
                     // previous response into the new bubble — the "previous response appears
                     // first, then swaps" bug. While the turn isn't yet open (or we're still in
                     // the pre-body think-gap), relay ONLY the spinner, never a scrape.
+                    // Pre-body discriminator is `!= Responding`, NOT `== Thinking`.
+                    // In the pre-body think-gap `detect_state` returns Idle, not
+                    // Thinking: scanning bottom-up the first status line is the `⏵⏵`
+                    // mode line (no "esc to interrupt" — that's on the spinner line
+                    // above the input box), and the input-box border blocks the
+                    // spinner from the second scan. Gating on `== Thinking` therefore
+                    // never fired the spinner. `Responding` is the one state meaning a
+                    // `●` body bullet is on screen, so `!= Responding` = "no body yet"
+                    // — relay the spinner — while generation (Responding) still falls
+                    // through to the gated body-streaming branch (can't freeze it).
                     let turn_started = s.jsonl_turn_open();
                     if !turn_started
-                        || (new_state == SessionState::Thinking && s.last_streamed.is_empty())
+                        || (new_state != SessionState::Responding && s.last_streamed.is_empty())
                     {
                         // Relay the live spinner line so the web shows the SAME shimmer as
                         // the terminal — never the stale previous response. Gated to before
@@ -530,6 +540,7 @@ impl Monitor {
                         let resp =
                             self.parser
                                 .extract_raw_response(s.baseline_msgs, &cap, Some(&s.sent), 0);
+                        let mut streamed = false;
                         if !resp.is_empty() && resp != s.last_streamed && resp != s.prev_final {
                             let collapsed = resp.len() * 2 < s.last_streamed.len();
                             if !collapsed {
@@ -537,6 +548,27 @@ impl Monitor {
                                     "session": s.name.clone(), "event": "replace", "text": resp.clone()
                                 }));
                                 s.last_streamed = resp;
+                                streamed = true;
+                            }
+                        }
+                        // MID-TURN TOOL GAP: the body didn't advance this poll, yet the
+                        // turn is open and we're past the first body bullet. That means a
+                        // tool is executing — in the JSONL the tool_use and its result land
+                        // PRE-PAIRED in a single poll, so there is no result-less window for
+                        // the frontend's per-tool spinner to catch, and the scraped body is
+                        // frozen on the `● ToolName(...)` line. Relay the live TUI spinner so
+                        // the web shows the SAME working shimmer as the terminal during the
+                        // gap (web↔terminal parity). On the next body advance we clear
+                        // last_thinking so a subsequent gap re-arms the spinner; the leading
+                        // `replace` clears the indicator frontend-side as text fills.
+                        if streamed {
+                            s.last_thinking = None;
+                        } else if let Some(spin) = self.parser.extract_spinner_line(&cap) {
+                            if s.last_thinking.as_deref() != Some(spin.as_str()) {
+                                events.push(json!({
+                                    "session": s.name.clone(), "event": "thinking", "text": spin.clone()
+                                }));
+                                s.last_thinking = Some(spin);
                             }
                         }
                     }
