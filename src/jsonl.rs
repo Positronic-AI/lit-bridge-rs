@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
@@ -59,6 +59,13 @@ pub struct JsonlWatcher {
     /// cursor) and the bridge stops observing, dropping the real text. So we defer:
     /// hold the turn open and complete once the text actually arrives.
     pending_complete: bool,
+    /// Snapshot of every `.jsonl` that existed in `project_dir` at `begin_turn`.
+    /// A mid-turn session roll is recognised by ABSENCE from this set (the file
+    /// was created after the pin), which is filesystem- and libc-independent —
+    /// unlike birth time (`created()`), which is silently unreadable on some
+    /// builds/mounts (static-musl, NFS/NAS) and there disables re-anchoring,
+    /// stranding the turn on the dead pinned file (the dormant-channel dark turn).
+    existing_at_pin: HashSet<PathBuf>,
     /// Wall-clock moment `begin_turn` pinned the active transcript. A conversation
     /// transcript whose BIRTH time is after this was created during the turn — i.e.
     /// a mid-turn session roll (a `[resumed]` session spins up a fresh transcript and
@@ -79,6 +86,7 @@ impl JsonlWatcher {
             open: false,
             pending_complete: false,
             pin_time: None,
+            existing_at_pin: HashSet::new(),
         };
         // Start at EOF of the active transcript so we only see NEW entries.
         if let Some(f) = w.find_active_jsonl() {
@@ -122,37 +130,89 @@ impl JsonlWatcher {
         cands.into_iter().next().map(|(_, p)| p) // fallback: newest overall
     }
 
+    /// Set of all `.jsonl` paths in `dir` right now — captured at `begin_turn` so a
+    /// roll target is recognised by absence (created after the pin). Only the dir
+    /// listing is needed, so this works regardless of build target or mount type.
+    fn snapshot_jsonl(dir: &Path) -> HashSet<PathBuf> {
+        let mut set = HashSet::new();
+        if let Ok(rd) = fs::read_dir(dir) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.extension().map(|e| e == "jsonl").unwrap_or(false) {
+                    set.insert(p);
+                }
+            }
+        }
+        set
+    }
+
     /// Detect a mid-turn session roll: the response is being written to a transcript
     /// that did not exist when this turn was pinned. Returns the roll target, or
     /// `None` if there isn't one.
     ///
-    /// The discriminator is BIRTH time, not mtime. `poll`'s anti-flap guard exists to
-    /// stop re-reading a *pre-existing* newer file from offset 0 and replaying its
-    /// historical `end_turn` (the channel-turns-2+ replay bug). A file BORN after the
-    /// pin can't carry that hazard — it holds only this turn — so switching to it is
-    /// the one safe cross-file move. We require `created() > pin_time`; if birth time
-    /// is unavailable we skip the file rather than guess, preserving the safe default.
+    /// The discriminator is ABSENCE from the pin-time snapshot, not birth time.
+    /// `poll`'s anti-flap guard exists to stop re-reading a *pre-existing* newer file
+    /// from offset 0 and replaying its historical `end_turn` (the channel-turns-2+
+    /// replay bug). A file that did NOT exist at pin time can't carry that hazard — it
+    /// holds only this turn — so switching to it is the one safe cross-file move.
+    /// We deliberately do NOT use `created()`: birth time is silently unreadable on
+    /// static-musl builds and NFS/NAS mounts, and there it stranded the turn on the
+    /// dead pinned file (the dormant-channel dark turn). Set-absence needs only the
+    /// directory listing, which always works.
     fn find_rolled_transcript(&self) -> Option<PathBuf> {
         let pin_time = self.pin_time?;
         let cur = self.file.as_ref();
         let mut best: Option<(SystemTime, PathBuf)> = None;
+        // DIAGNOSTIC (temp): record siblings written THIS turn that we declined to
+        // re-anchor onto, so a dark turn shows exactly why the roll target was passed
+        // over. Gated on mtime>pin below, so idle polls and stale corpses stay quiet.
+        let ms = |t: SystemTime| t.duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let short = |p: &Path| p.file_stem().map(|s| s.to_string_lossy().chars().take(8).collect::<String>()).unwrap_or_default();
+        let mut rejects: Vec<String> = Vec::new();
         for entry in fs::read_dir(&self.project_dir).ok()?.flatten() {
             let p = entry.path();
             if p.extension().map(|e| e == "jsonl").unwrap_or(false) {
                 if Some(&p) == cur {
                     continue;
                 }
-                // Must be provably born AFTER the pin — otherwise leave it alone.
-                let born = match entry.metadata().and_then(|m| m.created()) {
-                    Ok(b) => b,
+                let md = match entry.metadata() {
+                    Ok(m) => m,
                     Err(_) => continue,
                 };
-                if born > pin_time && is_conversation_transcript(&p) {
-                    if best.as_ref().map(|(t, _)| born > *t).unwrap_or(true) {
-                        best = Some((born, p));
+                // Only files touched since the pin are turn-relevant; skip corpses quietly.
+                let mtime_after = md.modified().map(|t| t > pin_time).unwrap_or(false);
+                if !mtime_after {
+                    continue;
+                }
+                // A file ABSENT from the pin-time snapshot was created during this turn
+                // — the one safe re-anchor target. No `created()` call, so no born_err.
+                let is_new = !self.existing_at_pin.contains(&p);
+                let conv = is_conversation_transcript(&p);
+                if is_new && conv {
+                    // Order by mtime (always readable) to pick the freshest roll target.
+                    let key = md.modified().unwrap_or(pin_time);
+                    if best.as_ref().map(|(t, _)| key > *t).unwrap_or(true) {
+                        best = Some((key, p));
                     }
+                } else {
+                    rejects.push(format!(
+                        "{}:is_new={} conv={} mtime_ms={}",
+                        short(&p), is_new, conv,
+                        md.modified().ok().map(ms).unwrap_or(0)
+                    ));
                 }
             }
+        }
+        if best.is_none() && !rejects.is_empty() {
+            crate::diag::log(
+                "RANCHOR_MISS",
+                &format!(
+                    "pin_ms={} cur={} rejects=[{}]",
+                    ms(pin_time),
+                    cur.map(|f| short(f)).unwrap_or_else(|| "<none>".into()),
+                    rejects.join(", ")
+                ),
+            );
         }
         best.map(|(_, p)| p)
     }
@@ -169,6 +229,11 @@ impl JsonlWatcher {
         // Stamp the pin moment so poll() can recognise a transcript born mid-turn
         // (a session roll) and distinguish it from a pre-existing newer file.
         self.pin_time = Some(SystemTime::now());
+        // Snapshot the transcripts that exist RIGHT NOW. A mid-turn roll writes the
+        // response to a brand-new file; `find_rolled_transcript` spots it by its
+        // absence from this set — no dependence on `created()` birth time, which is
+        // unreadable on static-musl / NAS and there leaves the turn dark.
+        self.existing_at_pin = Self::snapshot_jsonl(&self.project_dir);
         // Record exactly which transcript got pinned (and at what offset) so a turn
         // whose JSONL completion never fires can be traced to a stale/wrong-file pin
         // vs a mid-turn session roll — without this, the watcher is a black box.
