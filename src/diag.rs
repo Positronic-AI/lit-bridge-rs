@@ -14,10 +14,19 @@
 //!   RX   — a raw JSONL transcript line the watcher read
 //!   TURN — a watcher state transition (open/complete) with the parts count
 //!   EMIT — an event the daemon sent to the client (the consumer's ground truth)
+//!
+//! The log self-caps: once it passes `MAX_BYTES` it rotates to a single `.1`
+//! backup, so a long-lived bridge can't grow an unbounded trail (a 246 MB
+//! runaway is what prompted this). On-disk worst case is ~2× `MAX_BYTES`.
 
 use std::io::Write;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Rotate once the active log passes this size. 64 MiB keeps a deep trail for
+/// reconstructing a hang while capping the file; with the one `.1` backup the
+/// on-disk total stays under ~128 MiB.
+const MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Resolved once: `Some(path)` if logging is enabled, else `None`. Avoids an env
 /// lookup on every poll line after the first call.
@@ -62,5 +71,26 @@ pub fn log(tag: &str, payload: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "{} {} {}", epoch_ms(), tag, flat);
         let _ = f.flush();
+        // One fstat on the handle we already hold — cheap. Past the cap, rotate.
+        if let Ok(meta) = f.metadata() {
+            if meta.len() >= MAX_BYTES {
+                rotate(path);
+            }
+        }
     }
+}
+
+/// Single-backup rotation: `path` → `path.1` (replacing any prior backup); the
+/// next `log()` recreates a fresh `path` via `create(true)`. The re-check under
+/// the lock is what makes concurrent callers safe — the thread that wins renames
+/// the full log away, and every loser then sees a small file and bails, so a
+/// freshly rotated log is never renamed a second time.
+fn rotate(path: &str) {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.len() >= MAX_BYTES => {}
+        _ => return,
+    }
+    let _ = std::fs::rename(path, format!("{path}.1"));
 }
