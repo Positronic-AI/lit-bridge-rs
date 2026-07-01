@@ -73,6 +73,16 @@ pub struct JsonlWatcher {
     /// hold stale history for this turn, so it is the one cross-file switch `poll`
     /// may safely make. `None` until the first `begin_turn`.
     pin_time: Option<SystemTime>,
+    /// Accumulated Claude token usage for the CURRENT turn, summed across every
+    /// assistant entry that carries a `message.usage` block (a turn with tool calls
+    /// writes several, each billing its own input+output — summing is billing-correct).
+    /// Attached to the `turn_complete` event so per-turn token counts ride the same
+    /// rails as the response. Reset at `begin_turn` and at a new user-turn boundary.
+    turn_in_tokens: u64,
+    turn_out_tokens: u64,
+    turn_cache_read_tokens: u64,
+    turn_cache_creation_tokens: u64,
+    turn_usage_seen: bool,
 }
 
 impl JsonlWatcher {
@@ -87,6 +97,11 @@ impl JsonlWatcher {
             pending_complete: false,
             pin_time: None,
             existing_at_pin: HashSet::new(),
+            turn_in_tokens: 0,
+            turn_out_tokens: 0,
+            turn_cache_read_tokens: 0,
+            turn_cache_creation_tokens: 0,
+            turn_usage_seen: false,
         };
         // Start at EOF of the active transcript so we only see NEW entries.
         if let Some(f) = w.find_active_jsonl() {
@@ -250,6 +265,17 @@ impl JsonlWatcher {
         self.turn_text_parts.clear();
         self.open = false;
         self.pending_complete = false;
+        self.reset_turn_usage();
+    }
+
+    /// Zero the per-turn token accumulator. Called at both turn-reset points
+    /// (`begin_turn` and a new user-turn boundary) so usage never bleeds across turns.
+    fn reset_turn_usage(&mut self) {
+        self.turn_in_tokens = 0;
+        self.turn_out_tokens = 0;
+        self.turn_cache_read_tokens = 0;
+        self.turn_cache_creation_tokens = 0;
+        self.turn_usage_seen = false;
     }
 
     /// True while the JSONL transcript shows the turn still in progress. The TUI
@@ -410,6 +436,25 @@ impl JsonlWatcher {
                             }
                         }
                     }
+                    // Accumulate Claude's per-message token usage. Additive to the
+                    // turn total; missing/non-numeric fields contribute 0. Independent
+                    // of the completion gate below — purely records what the entry bills.
+                    if let Some(u) = msg.get("usage") {
+                        let get = |k: &str| u.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+                        let (i, o, cr, cc) = (
+                            get("input_tokens"),
+                            get("output_tokens"),
+                            get("cache_read_input_tokens"),
+                            get("cache_creation_input_tokens"),
+                        );
+                        if i + o + cr + cc > 0 {
+                            self.turn_in_tokens += i;
+                            self.turn_out_tokens += o;
+                            self.turn_cache_read_tokens += cr;
+                            self.turn_cache_creation_tokens += cc;
+                            self.turn_usage_seen = true;
+                        }
+                    }
                     match msg.get("stop_reason").and_then(|v| v.as_str()) {
                         // Terminal stop reasons: the turn is over. DEFER emitting
                         // turn_complete to the end of the poll — Claude frequently writes
@@ -448,6 +493,7 @@ impl JsonlWatcher {
                         self.emitted_tool_ids.clear();
                         self.open = true;
                         self.pending_complete = false;
+                        self.reset_turn_usage();
                     }
                     if let Some(blocks) = msg.get("content").and_then(|v| v.as_array()) {
                         for block in blocks {
@@ -500,7 +546,16 @@ impl JsonlWatcher {
             );
             self.open = false;
             self.pending_complete = false;
-            events.push(json!({"event": "turn_complete", "content": content}));
+            let mut ev = json!({"event": "turn_complete", "content": content});
+            if self.turn_usage_seen {
+                ev["usage"] = json!({
+                    "input_tokens": self.turn_in_tokens,
+                    "output_tokens": self.turn_out_tokens,
+                    "cache_read_tokens": self.turn_cache_read_tokens,
+                    "cache_creation_tokens": self.turn_cache_creation_tokens,
+                });
+            }
+            events.push(ev);
             self.turn_text_parts.clear();
         } else if want_complete {
             // Terminal stop seen but nothing to emit yet — defer. Keep the turn open

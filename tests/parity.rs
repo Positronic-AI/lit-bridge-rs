@@ -33,6 +33,31 @@ fn parser_matches_python_oracle() {
     }
 }
 
+/// Regression for the thinking-first streaming stall: the "esc to interrupt" hint is on
+/// screen during BOTH thinking and talking, so it can't classify the turn on its own. Once
+/// the model finishes thinking (`✻ Thought for Ns`) and starts rendering prose (an active
+/// `●` bullet), the turn is `responding` — even though the interrupt hint is still shown.
+/// Before the fix, `has_interrupt` short-circuited to `thinking` for the whole generation,
+/// so the scrape-stream gate (which opens only on `responding`) never opened and nothing
+/// streamed to the webapp until the final JSONL dump.
+#[test]
+fn thinking_first_talking_phase_is_responding() {
+    let parser = select_parser("claude-code").expect("claude-code parser");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let cap = String::from_utf8_lossy(
+        &std::fs::read(dir.join("claude_2.1.x_thinking_first_talking.txt"))
+            .expect("thinking-first-talking fixture"),
+    )
+    .into_owned();
+    assert_eq!(
+        parser.detect_state(&cap).as_str(),
+        "responding",
+        "an active response bullet must read as responding even while 'esc to interrupt' shows"
+    );
+    // And we must NOT relay a stale spinner once prose is rendering.
+    assert_eq!(parser.extract_spinner_line(&cap), None);
+}
+
 /// The think-gap relay: during `thinking` the spinner line is returned (web shows the
 /// same shimmer as the terminal); during `responding` it is `None` (we stream the body
 /// instead, never a stale spinner). Guards the duplicate-of-last-message regression.
@@ -61,5 +86,51 @@ fn spinner_line_only_during_think_gap() {
         parser.extract_spinner_line(&responding),
         None,
         "must not relay a spinner once the response is rendering"
+    );
+}
+
+/// Regression: transient nags the TUI sprays below the spinner (npm auto-update
+/// warning, `⎿ Tip:` lines) must not poison the bottom-up spinner scan. Before the
+/// fix, `extract_spinner_line` bailed on the first unrecognized line and returned
+/// None, so the real verb (`✶ Julienning…`) never relayed and the web fell back to
+/// throbbing dots. See bridge-rs-evt log 2026-06-24: 40 polls, all spinner=false,
+/// despite a visible verb.
+#[test]
+fn spinner_survives_trailing_nags() {
+    let parser = select_parser("claude-code").expect("claude-code parser");
+
+    // Spinner present, with chrome + nags stacked below it.
+    let with_nags = "\
+● Some earlier response text that has already streamed.
+
+  Running 1 shell command…
+✶ Julienning… (2m 55s · ↓ 10.1k tokens)
+  ⎿  Tip: Use /btw to ask a quick side question without interrupting Claude
+─────────────────────────────────────────
+❯
+─────────────────────────────────────────
+✘ Auto-update failed: no write permission to npm prefix · Run /doctor
+";
+    let spin = parser
+        .extract_spinner_line(with_nags)
+        .expect("spinner must be found despite trailing auto-update nag and Tip line");
+    assert!(
+        spin.contains("Julienning") && spin.contains('…'),
+        "expected the active spinner verb line, got {spin:?}"
+    );
+
+    // No active spinner: a settled response bullet with the same nags below must
+    // still read as "no think-gap" (None), not get confused by the nag lines.
+    let settled = "\
+● A fully rendered response with no active spinner.
+─────────────────────────────────────────
+❯
+─────────────────────────────────────────
+✘ Auto-update failed: no write permission to npm prefix · Run /doctor
+";
+    assert_eq!(
+        parser.extract_spinner_line(settled),
+        None,
+        "a settled response must not yield a spinner just because nags trail it"
     );
 }

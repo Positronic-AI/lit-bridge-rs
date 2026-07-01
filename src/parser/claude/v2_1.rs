@@ -90,6 +90,47 @@ impl ClaudeV21Parser {
         let t = t.strip_prefix(marker).unwrap_or(t);
         t.trim_start().to_string()
     }
+
+    /// True if the screen's content area ends with an active assistant response
+    /// bullet (`●`) — i.e. real prose is the live tail of output, not a thinking
+    /// spinner. Strips trailing chrome (picker / separator / prompt / status /
+    /// compact bar), finds the last response bullet, and requires the lines after
+    /// it to be plain prose: no thinking-spinner glyph and no `✻` completion
+    /// marker (both matched by `re_thinking_spinner`, whose glyph range a `●`
+    /// bullet falls outside of). Used to tell Responding from Thinking even while
+    /// the "esc to interrupt" hint is on screen.
+    fn has_active_response_bullet(&self, capture: &str) -> bool {
+        let mut content_lines: Vec<&str> = capture.split('\n').collect();
+        while let Some(last) = content_lines.last() {
+            let s = last.trim();
+            if s.is_empty()
+                || self.re_conversation_picker.is_match(s)
+                || self.re_separator.is_match(s)
+                || s.starts_with('❯')
+                || self.re_status.is_match(s)
+                || self.re_compact_progress.is_match(s)
+            {
+                content_lines.pop();
+            } else {
+                break;
+            }
+        }
+        let content_area = content_lines.join("\n");
+        if let Some(pos) = content_area.rfind('●') {
+            let after = &content_area[pos..];
+            // The bullet is the live tail UNLESS a prior-turn boundary sits between
+            // it and the screen bottom: a `✻ …(duration)` completion marker or a `❯`
+            // user line. An ACTIVE spinner (`✻ Thinking… (36s)`, no duration) parked
+            // below the prose is expected once a thinking-first turn starts talking,
+            // so it must NOT disqualify the bullet — that latch left state stuck on
+            // Thinking for the whole turn, so the scrape-stream gate never opened and
+            // the web showed only ellipses until the final JSONL dump.
+            return !after
+                .lines()
+                .any(|l| self.is_completion(l.trim()) || self.re_user.is_match(l));
+        }
+        false
+    }
 }
 
 impl TuiParser for ClaudeV21Parser {
@@ -145,6 +186,15 @@ impl TuiParser for ClaudeV21Parser {
         }
 
         if has_interrupt {
+            // The "esc to interrupt" hint is present during BOTH the thinking and
+            // talking phases of a turn, so it can't distinguish them on its own. If
+            // real assistant prose is already on screen, this is Responding — not
+            // Thinking. Without this check a thinking-first turn latches Thinking for
+            // the whole generation and the scrape-stream gate (which only opens on
+            // Responding) never opens, so nothing streams until the final JSONL dump.
+            if self.has_active_response_bullet(capture) {
+                return SessionState::Responding;
+            }
             return SessionState::Thinking;
         }
         if has_prompt {
@@ -176,56 +226,33 @@ impl TuiParser for ClaudeV21Parser {
             break;
         }
 
-        // Strip conversation picker / chrome from the bottom, then look for an
-        // active (unterminated) response bullet.
-        let mut content_lines: Vec<&str> = capture.split('\n').collect();
-        while let Some(last) = content_lines.last() {
-            let s = last.trim();
-            if s.is_empty()
-                || self.re_conversation_picker.is_match(s)
-                || self.re_separator.is_match(s)
-                || s.starts_with('❯')
-                || self.re_status.is_match(s)
-                || self.re_compact_progress.is_match(s)
-            {
-                content_lines.pop();
-            } else {
-                break;
-            }
-        }
-        let content_area = content_lines.join("\n");
-        if let Some(pos) = content_area.rfind('●') {
-            let after = &content_area[pos..];
-            if !after.contains('✻') && !after.contains('✽') {
-                return SessionState::Responding;
-            }
+        if self.has_active_response_bullet(capture) {
+            return SessionState::Responding;
         }
 
         SessionState::Idle
     }
 
     fn extract_spinner_line(&self, capture: &str) -> Option<String> {
-        // Scan from the bottom for the active spinner verb line (`✽ Thinking…`),
-        // skipping trailing chrome (blank lines, separators, `⏵`/`▸` mode &
-        // `esc to interrupt` status lines, the compact bar, the conversation picker,
-        // and the `❯` prompt). If we reach real content (a response bullet `●` or a
-        // `✻` completion marker) before finding a spinner, the turn has already
-        // produced output — not a think-gap — so return None.
+        // Scan from the bottom for the active spinner verb line (`✽ Thinking…`).
+        // The spinner sits above a variable stack of trailing chrome: blank lines,
+        // separators, `⏵`/`▸` mode & `esc to interrupt` status lines, the compact
+        // bar, the conversation picker, the `❯` prompt, and *transient nags* the TUI
+        // sprays at the bottom (e.g. `✘ Auto-update failed … Run /doctor`, `⎿ Tip:`).
+        // We can't enumerate every nag, so rather than bail on the first
+        // unrecognized line we keep scanning upward, returning the spinner the
+        // moment we find it. We only conclude "no think-gap" when we positively
+        // reach real output — a response bullet `●` or a `✻` completion marker —
+        // before any spinner (the spinner always carries `…`, so a settled `✻`
+        // line without one is correctly read as content, not a spinner).
         for line in capture.split('\n').rev() {
             let s = line.trim();
-            if s.is_empty()
-                || self.re_separator.is_match(s)
-                || self.re_status.is_match(s)
-                || self.re_compact_progress.is_match(s)
-                || self.re_conversation_picker.is_match(s)
-                || s.starts_with('❯')
-            {
-                continue;
-            }
             if self.re_spinner_active.is_match(s) {
                 return Some(s.to_string());
             }
-            return None;
+            if self.re_response.is_match(s) || self.re_completion.is_match(s) {
+                return None;
+            }
         }
         None
     }

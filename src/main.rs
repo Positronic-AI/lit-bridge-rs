@@ -207,7 +207,17 @@ impl Monitor {
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
             .unwrap_or_default();
-        let cwd: Option<String> = cmd.get("working_dir").and_then(|v| v.as_str()).map(String::from);
+        // Default a missing/null/empty working_dir to $HOME. A None cwd is dangerous:
+        // claude would launch in the daemon's own cwd AND `cwd.map(...)` in Session::spawn
+        // would create NO JSONL watcher (cwd.map → None) — the turn then never streams and
+        // only closes at the ~600s MAX_TURN cap. Falling back to $HOME keeps claude's cwd
+        // and the watched project dir consistent so a watcher always exists.
+        let cwd: Option<String> = cmd
+            .get("working_dir")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .or_else(|| std::env::var("HOME").ok());
         let mut env = HashMap::new();
         if let Some(o) = cmd.get("env").and_then(|v| v.as_object()) {
             for (k, v) in o {
@@ -471,9 +481,15 @@ impl Monitor {
                     match ev.get("event").and_then(|v| v.as_str()) {
                         Some("turn_complete") => {
                             let content = ev.get("content").cloned().unwrap_or_else(|| json!(""));
-                            events.push(json!({
+                            let mut complete = json!({
                                 "session": s.name.clone(), "event": "complete", "content": content
-                            }));
+                            });
+                            // Forward per-turn token usage (present when the JSONL
+                            // carried a usage block) so the backend can surface it.
+                            if let Some(usage) = ev.get("usage") {
+                                complete["usage"] = usage.clone();
+                            }
+                            events.push(complete);
                             s.observing = false;
                         }
                         _ => {

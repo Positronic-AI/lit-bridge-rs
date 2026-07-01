@@ -1,0 +1,18 @@
+╭──────────────────────────────────────────────────────────────────╮
+│ ✻ Claude Code v2.1.152                                             │
+│                                                                    │
+│   /opt/lit-platform                                                │
+╰──────────────────────────────────────────────────────────────────╯
+
+❯ You have 12 identical-looking balls, one is a different weight. Find it.
+
+✻ Thought for 41s
+
+● Label the balls 1–12. The trick is that each weighing has three outcomes
+  (left heavy / balanced / right heavy), so three weighings give 3³ = 27
+  distinguishable results — plenty to pin down one ball and its direction.
+
+  Weighing 1: {1,2,3,4} vs {5,6,7,8}. If they balance, the odd ball is in
+
+────────────────────────────────────────────────────────────────────────
+⏵ esc to interrupt
