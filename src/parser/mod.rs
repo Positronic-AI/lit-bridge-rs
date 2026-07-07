@@ -99,6 +99,18 @@ pub trait TuiParser {
         baseline_completions: usize,
     ) -> String;
 
+    /// Isolate the response region: the split screen lines plus the `[start, end)` row
+    /// range of the current turn's response. Shared by `extract_raw_response` (which
+    /// joins the range) and the reflow path (which re-flows it) so both use identical
+    /// isolation logic.
+    fn locate_response<'a>(
+        &self,
+        baseline_count: usize,
+        capture: &'a str,
+        sent_content: Option<&str>,
+        baseline_completions: usize,
+    ) -> (Vec<&'a str>, Option<usize>, usize);
+
     /// The active spinner/status line shown during a think-gap — e.g.
     /// `✽ Thinking… (esc to interrupt · 3s · ↑ 1.2k tokens)` — returned raw so the
     /// web can render the SAME shimmer as the terminal. `None` when no in-progress

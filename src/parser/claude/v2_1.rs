@@ -458,6 +458,28 @@ impl TuiParser for ClaudeV21Parser {
         sent_content: Option<&str>,
         baseline_completions: usize,
     ) -> String {
+        let (lines, start_idx, end_idx) =
+            self.locate_response(baseline_count, capture, sent_content, baseline_completions);
+        match start_idx {
+            None => String::new(),
+            Some(si) => lines[si..end_idx].join("\n").trim_end().to_string(),
+        }
+    }
+
+    /// Isolate the response region from the screen. Returns the split lines and the
+    /// `[start, end)` row range of the current turn's response (first new bullet →
+    /// closing completion), via the same landmark / bullet-count / needle / last-bullet /
+    /// thinking-gap strategies. Shared by `extract_raw_response` (which joins the region)
+    /// and the reflow path (which re-flows it). Kept as its own method so both consumers
+    /// use identical isolation. Line index == vt100 row index (Ink never triggers a
+    /// soft-wrap), so callers can map a row range back to screen cells for classification.
+    fn locate_response<'a>(
+        &self,
+        baseline_count: usize,
+        capture: &'a str,
+        sent_content: Option<&str>,
+        baseline_completions: usize,
+    ) -> (Vec<&'a str>, Option<usize>, usize) {
         let lines: Vec<&str> = capture.split('\n').collect();
 
         // Trim the bottom panel (separator, prompt, status, picker, chrome).
@@ -629,10 +651,7 @@ impl TuiParser for ClaudeV21Parser {
             }
         }
 
-        match start_idx {
-            None => String::new(),
-            Some(si) => lines[si..end_idx].join("\n").trim_end().to_string(),
-        }
+        (lines, start_idx, end_idx)
     }
 
     fn turn_complete(&self, capture: &str) -> bool {
