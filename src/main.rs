@@ -432,8 +432,17 @@ impl Monitor {
     /// observer.py port, a later milestone.)
     async fn poll(&mut self) {
         let mut events: Vec<Value> = Vec::new();
+        // Reflow (un-wrap the Ink-rendered grid into logical prose) is opt-in via
+        // LIT_BRIDGE_RS_REFLOW. Default off => streamed text is byte-identical to today.
+        let reflow_on = std::env::var("LIT_BRIDGE_RS_REFLOW").is_ok();
         for s in self.sessions.values_mut() {
-            let cap = s.capture();
+            // When reflow is on, grab the per-row classification from the SAME screen
+            // lock as the text so `row_kinds` stays aligned with `cap`'s lines.
+            let (cap, row_kinds) = if reflow_on {
+                s.capture_with_kinds()
+            } else {
+                (s.capture(), Vec::new())
+            };
             // Reset the quiescence clock whenever the screen changes.
             if cap != s.last {
                 s.last_change = Instant::now();
@@ -556,9 +565,19 @@ impl Monitor {
                         // bullet `●`: on a long response it scrolls off the top of the
                         // visible screen and never returns, which would freeze the
                         // stream on a stale partial.)
-                        let resp =
+                        let resp = if reflow_on && !row_kinds.is_empty() {
+                            self.parser.extract_raw_response_reflowed(
+                                s.baseline_msgs,
+                                &cap,
+                                Some(&s.sent),
+                                0,
+                                &row_kinds,
+                                COLS as usize,
+                            )
+                        } else {
                             self.parser
-                                .extract_raw_response(s.baseline_msgs, &cap, Some(&s.sent), 0);
+                                .extract_raw_response(s.baseline_msgs, &cap, Some(&s.sent), 0)
+                        };
                         let mut streamed = false;
                         if !resp.is_empty() && resp != s.last_streamed && resp != s.prev_final {
                             let collapsed = resp.len() * 2 < s.last_streamed.len();
@@ -649,9 +668,19 @@ impl Monitor {
                 let complete = (elapsed >= MIN_TURN && quiescent && tui_done)
                     || elapsed >= MAX_TURN;
                 if complete {
-                    let resp =
+                    let resp = if reflow_on && !row_kinds.is_empty() {
+                        self.parser.extract_raw_response_reflowed(
+                            s.baseline_msgs,
+                            &cap,
+                            Some(&s.sent),
+                            0,
+                            &row_kinds,
+                            COLS as usize,
+                        )
+                    } else {
                         self.parser
-                            .extract_raw_response(s.baseline_msgs, &cap, Some(&s.sent), 0);
+                            .extract_raw_response(s.baseline_msgs, &cap, Some(&s.sent), 0)
+                    };
                     events.push(json!({
                         "session": s.name.clone(), "event": "complete", "content": resp
                     }));

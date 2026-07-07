@@ -269,6 +269,25 @@ impl Session {
             .unwrap_or_default()
     }
 
+    /// Like [`capture`], but also returns the per-row classification (prose / verbatim /
+    /// blank) from the SAME screen lock, so `row_kinds[i]` stays aligned with screen line
+    /// `i` for the reflow path. Only called when reflow is enabled (the per-row cell scan
+    /// isn't free), so plain `capture` stays the hot path.
+    pub fn capture_with_kinds(&self) -> (String, Vec<crate::reflow::RowKind>) {
+        self.screen
+            .lock()
+            .map(|g| {
+                let screen = g.screen();
+                let (rows, cols) = screen.size();
+                let text = screen.contents();
+                let kinds = (0..rows)
+                    .map(|r| crate::reflow::classify_row(screen, r, cols))
+                    .collect();
+                (text, kinds)
+            })
+            .unwrap_or_default()
+    }
+
     /// The rendered screen WITH styling (SGR color attributes + cursor positioning),
     /// as a terminal byte stream. Used to paint a freshly-attached terminal client so
     /// it shows color immediately instead of waiting for the CLI's next full redraw.
