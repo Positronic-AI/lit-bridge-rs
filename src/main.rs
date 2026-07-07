@@ -432,10 +432,21 @@ impl Monitor {
     /// observer.py port, a later milestone.)
     async fn poll(&mut self) {
         let mut events: Vec<Value> = Vec::new();
-        // Reflow (un-wrap the Ink-rendered grid into logical prose) is opt-in via
-        // LIT_BRIDGE_RS_REFLOW. Default off => streamed text is byte-identical to today.
-        let reflow_on = std::env::var("LIT_BRIDGE_RS_REFLOW").is_ok();
+        // Reflow (un-wrap the Ink-rendered grid into logical prose) is opt-in AND scoped
+        // to a SINGLE channel: LIT_BRIDGE_RS_REFLOW=<channel_id> enables it only for
+        // sessions serving that channel. Every other channel — including the one we
+        // communicate on — stays byte-identical to today, so there's always a known-good
+        // medium to evaluate against. Unset/empty => reflow off everywhere.
+        let reflow_channel = std::env::var("LIT_BRIDGE_RS_REFLOW")
+            .ok()
+            .filter(|s| !s.is_empty());
         for s in self.sessions.values_mut() {
+            // Session key is `lit-<user>-<agent>:<channel_id>`; the `:` anchor stops a
+            // channel id from matching another that merely ends with the same text.
+            let reflow_on = reflow_channel
+                .as_deref()
+                .map(|c| s.name.ends_with(&format!(":{c}")))
+                .unwrap_or(false);
             // When reflow is on, grab the per-row classification from the SAME screen
             // lock as the text so `row_kinds` stays aligned with `cap`'s lines.
             let (cap, row_kinds) = if reflow_on {
