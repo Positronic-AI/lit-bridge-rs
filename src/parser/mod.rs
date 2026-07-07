@@ -22,6 +22,8 @@ pub mod registry;
 
 pub use registry::select_parser;
 
+use crate::reflow::{first_word_len, RowKind};
+
 /// The lifecycle state of a CLI session as read from its rendered screen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SessionState {
@@ -110,6 +112,89 @@ pub trait TuiParser {
         sent_content: Option<&str>,
         baseline_completions: usize,
     ) -> (Vec<&'a str>, Option<usize>, usize);
+
+    /// Like [`extract_raw_response`], but re-flows the located region: prose soft-wraps
+    /// are rejoined into logical lines while structural markers (bullets `●`, tool
+    /// results `⎿`, completions `✻`) and verbatim rows (code/tables, per `row_kinds`) are
+    /// preserved. `row_kinds[i]` classifies grid row `i` (== screen line `i`, since Ink
+    /// never triggers a soft-wrap); it must cover the located region or we fall back to
+    /// the plain join. The un-wrap test is width-agnostic: the wrap width is taken as the
+    /// widest line in the region (wrapped lines reach the terminal width). This is a
+    /// default method shared by all parsers — it depends only on `locate_response`.
+    fn extract_raw_response_reflowed(
+        &self,
+        baseline_count: usize,
+        capture: &str,
+        sent_content: Option<&str>,
+        baseline_completions: usize,
+        row_kinds: &[RowKind],
+        content_width: usize,
+    ) -> String {
+        let (lines, start_idx, end_idx) =
+            self.locate_response(baseline_count, capture, sent_content, baseline_completions);
+        let si = match start_idx {
+            Some(s) => s,
+            None => return String::new(),
+        };
+        // Alignment guard: without kinds covering the region, fall back to the join.
+        if row_kinds.len() < end_idx {
+            return lines[si..end_idx].join("\n").trim_end().to_string();
+        }
+        // `content_width` is the terminal width the content was rendered at (the live
+        // bridge PTY is a fixed 200). A prose display line was soft-wrapped iff the next
+        // line's first word could not have fit within it.
+
+        let mut out: Vec<String> = Vec::new();
+        let mut cur: Option<String> = None; // open prose logical line (keeps its ●/indent)
+        let mut last_len = 0usize; // char length of the LAST display line folded into cur
+        for i in si..end_idx {
+            let line = lines[i].trim_end();
+            let t = line.trim_start();
+            let is_blank = t.is_empty();
+            let is_marker = t.starts_with('⎿') || t.starts_with('✻');
+            let is_bullet = t.starts_with('●');
+            let is_verbatim = row_kinds[i] == RowKind::Verbatim;
+
+            if is_blank {
+                if let Some(c) = cur.take() {
+                    out.push(c);
+                }
+                out.push(String::new());
+            } else if is_verbatim || is_marker {
+                if let Some(c) = cur.take() {
+                    out.push(c);
+                }
+                out.push(line.to_string()); // preserve exactly
+            } else if is_bullet {
+                if let Some(c) = cur.take() {
+                    out.push(c);
+                }
+                cur = Some(line.to_string()); // new logical line, keep the "● " prefix
+                last_len = line.chars().count();
+            } else {
+                // a "  " prose continuation — rejoin iff the PREVIOUS display line was
+                // full (its first word couldn't have fit). Test the last display line's
+                // length, NOT the accumulated logical line (which spans multiple).
+                let wrapped =
+                    cur.is_some() && last_len + 1 + first_word_len(t) > content_width;
+                if wrapped {
+                    let c = cur.as_mut().unwrap();
+                    c.push(' ');
+                    c.push_str(t);
+                } else {
+                    if let Some(c) = cur.take() {
+                        out.push(c);
+                    }
+                    cur = Some(line.to_string());
+                }
+                last_len = line.chars().count();
+            }
+        }
+        if let Some(c) = cur.take() {
+            out.push(c);
+        }
+        out.join("\n").trim_end().to_string()
+    }
 
     /// The active spinner/status line shown during a think-gap — e.g.
     /// `✽ Thinking… (esc to interrupt · 3s · ↑ 1.2k tokens)` — returned raw so the

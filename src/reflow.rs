@@ -71,7 +71,8 @@ pub fn classify_row(screen: &Screen, row: u16, cols: u16) -> RowKind {
     }
 }
 
-fn first_word_len(s: &str) -> usize {
+/// Character length of the first whitespace-delimited word of `s` (for the un-wrap test).
+pub fn first_word_len(s: &str) -> usize {
     s.trim_start()
         .split(' ')
         .next()
