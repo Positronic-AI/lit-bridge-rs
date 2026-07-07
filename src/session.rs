@@ -355,6 +355,15 @@ impl Session {
         self.jsonl.as_mut().map(|j| j.poll()).unwrap_or_default()
     }
 
+    /// Re-anchor the JSONL watcher to the transcript tail after a turn completes, so the
+    /// organic (un-observed) path never re-reads the just-finished turn. No-op if the
+    /// session has no watcher.
+    pub fn prime_jsonl_to_eof(&mut self) {
+        if let Some(j) = &mut self.jsonl {
+            j.prime_to_eof();
+        }
+    }
+
     /// Send a named key (for dialogs / navigation).
     pub fn send_key(&mut self, key: &str) -> Result<()> {
         if self.win32_active() {

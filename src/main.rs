@@ -491,6 +491,9 @@ impl Monitor {
                             }
                             events.push(complete);
                             s.observing = false;
+                            // Re-anchor the watcher to the tail so the organic path
+                            // (below, next poll) can't re-read this finished turn.
+                            s.prime_jsonl_to_eof();
                         }
                         _ => {
                             let mut e = ev;
@@ -589,6 +592,48 @@ impl Monitor {
                         }
                     }
                 }
+            } else {
+                // ORGANIC PATH — relay turns the webapp did NOT initiate. A background
+                // re-invocation (e.g. an async `Agent` completes and the harness re-runs
+                // claude with no `cmd_send`) writes a full turn to the transcript while
+                // `observing` is false. Without this branch that content is emitted
+                // NOWHERE — blank in the webapp even after a channel reload, because it
+                // is never persisted. The watcher self-primes to EOF (at construction and
+                // at each turn completion), so `poll_jsonl` yields entries only once a
+                // genuine NEW turn lands here.
+                //
+                // v1 relays the clean final content only (the authoritative
+                // `turn_complete`), tagged `organic: true` + the `channel_id` parsed from
+                // the session key (`<name>:<channel_id>`). The API's already-wired
+                // `_handle_organic_event` path persists it to the channel store and pushes
+                // it over the channel WebSocket; `_heartbeat_is_handling_channel` guards
+                // against double-emit if the heartbeat is servicing the same channel.
+                // Live `replace`/tool streaming for organic turns can layer on later.
+                let channel_id = s.name.rsplit_once(':').map(|(_, c)| c.to_string());
+                if let Some(cid) = channel_id {
+                    for ev in s.poll_jsonl() {
+                        if ev.get("event").and_then(|v| v.as_str()) != Some("turn_complete") {
+                            continue; // v1: drop mid-turn tool_use/tool_result frames
+                        }
+                        let content = ev.get("content").cloned().unwrap_or_else(|| json!(""));
+                        let nonempty =
+                            content.as_str().map(|c| !c.trim().is_empty()).unwrap_or(false);
+                        if !nonempty {
+                            continue;
+                        }
+                        let mut complete = json!({
+                            "session": s.name.clone(),
+                            "event": "complete",
+                            "organic": true,
+                            "content": content,
+                            "channel_id": cid,
+                        });
+                        if let Some(usage) = ev.get("usage") {
+                            complete["usage"] = usage.clone();
+                        }
+                        events.push(complete);
+                    }
+                }
             }
             // TUI FALLBACK — corroborates, never overrides. It may close a turn ONLY
             // when the JSONL is not holding it open (no pending tool_use), and only after
@@ -611,6 +656,10 @@ impl Monitor {
                         "session": s.name.clone(), "event": "complete", "content": resp
                     }));
                     s.observing = false;
+                    // The JSONL `turn_complete` for THIS turn may still be unwritten
+                    // (the TUI fallback closed it first). Skip past it so the organic
+                    // path doesn't re-emit the same response as an out-of-band turn.
+                    s.prime_jsonl_to_eof();
                 }
             }
             s.last = cap;

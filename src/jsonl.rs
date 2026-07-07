@@ -284,6 +284,27 @@ impl JsonlWatcher {
         self.open
     }
 
+    /// Advance to EOF of the active transcript and drop any in-flight turn state,
+    /// WITHOUT re-pinning (`pin_time`/`existing_at_pin` are left as-is — those are the
+    /// observed-turn roll machinery). Called the instant a turn completes so the
+    /// organic watcher starts clean at the tail: it must NOT re-read the just-finished
+    /// turn's trailing JSONL (e.g. a late `turn_complete` written after the TUI fallback
+    /// already closed the turn — that would double-emit the same response as organic).
+    pub fn prime_to_eof(&mut self) {
+        self.file = self.find_active_jsonl();
+        self.pos = self
+            .file
+            .as_ref()
+            .and_then(|f| fs::metadata(f).ok())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        self.emitted_tool_ids.clear();
+        self.turn_text_parts.clear();
+        self.open = false;
+        self.pending_complete = false;
+        self.reset_turn_usage();
+    }
+
     pub fn get_session_id(&self) -> Option<String> {
         let f = self.file.clone().or_else(|| self.find_active_jsonl())?;
         f.file_stem().map(|s| s.to_string_lossy().to_string())
