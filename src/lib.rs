@@ -4,4 +4,5 @@
 pub mod diag;
 pub mod jsonl;
 pub mod parser;
+pub mod reflow;
 pub mod session;
