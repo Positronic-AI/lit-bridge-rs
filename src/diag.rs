@@ -63,6 +63,67 @@ fn epoch_ms() -> u128 {
         .unwrap_or(0)
 }
 
+/// Reflow-frame dump target. `Some(path)` only when `LIT_BRIDGE_RS_REFLOW_FRAMES`
+/// is set to a truthy value (a path, or `1`/`on`/`true` → the default file). This
+/// is a temporary verification aid: the streamed `replace` frames carry the reflow
+/// scrape output, which the JSONL `complete` swaps away and never persists — so
+/// without this the reflowed text can't be audited after the fact. Off by default.
+fn reflow_frames_target() -> Option<&'static str> {
+    static TARGET: OnceLock<Option<String>> = OnceLock::new();
+    TARGET
+        .get_or_init(|| match std::env::var("LIT_BRIDGE_RS_REFLOW_FRAMES") {
+            Ok(v) => {
+                let t = v.trim();
+                match t.to_ascii_lowercase().as_str() {
+                    "" | "off" | "0" | "none" | "false" => None,
+                    "1" | "on" | "true" | "yes" => {
+                        let user = std::env::var("USER")
+                            .or_else(|_| std::env::var("LOGNAME"))
+                            .unwrap_or_else(|_| "unknown".to_string());
+                        Some(format!("/tmp/bridge-rs-reflow-{user}.log"))
+                    }
+                    _ => Some(t.to_string()),
+                }
+            }
+            Err(_) => None,
+        })
+        .as_deref()
+}
+
+/// True iff `session` is the one reflow is scoped to (`LIT_BRIDGE_RS_REFLOW=<channel>`
+/// and the session key ends `:<channel>`) — mirrors the gate in `main.rs`. Lets the
+/// frame dump capture ONLY reflowed sessions, so other channels' plain-join `replace`
+/// and JSONL `complete` events don't pollute the audit file. Cached channel lookup.
+pub fn session_is_reflow_scoped(session: &str) -> bool {
+    static CHANNEL: OnceLock<Option<String>> = OnceLock::new();
+    let ch = CHANNEL
+        .get_or_init(|| std::env::var("LIT_BRIDGE_RS_REFLOW").ok().filter(|s| !s.is_empty()))
+        .as_deref();
+    ch.map(|c| session.ends_with(&format!(":{c}"))).unwrap_or(false)
+}
+
+/// Append one reflow frame VERBATIM (real newlines preserved), delimited so the
+/// last `replace` before a `complete` can be diffed against the JSONL `complete`.
+/// No-op unless `LIT_BRIDGE_RS_REFLOW_FRAMES` is enabled. Record format:
+///   `===8<=== ts=<ms> ev=<event> sess=<session> chars=<n>\n<content>\n`
+pub fn log_frame(session: &str, event: &str, content: &str) {
+    let Some(path) = reflow_frames_target() else { return };
+    let chars = content.chars().count();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(
+            f,
+            "===8<=== ts={} ev={event} sess={session} chars={chars}\n{content}",
+            epoch_ms()
+        );
+        let _ = f.flush();
+        if let Ok(meta) = f.metadata() {
+            if meta.len() >= MAX_BYTES {
+                rotate(path);
+            }
+        }
+    }
+}
+
 /// Append one diagnostic record. No-op unless the log file is configured.
 pub fn log(tag: &str, payload: &str) {
     let Some(path) = target() else { return };

@@ -244,9 +244,13 @@ impl Session {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    /// Terminate the child CLI process.
+    /// Terminate the child CLI process AND reap it. `kill()` alone only sends the
+    /// signal; without a following `wait()` the exited child lingers as a `<defunct>`
+    /// zombie until the bridge itself dies — the leak that accumulated dozens of dead
+    /// claude procs per user. `wait()` reaps it immediately (SIGKILL exits fast).
     pub fn kill(&mut self) {
         let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 
     /// Subscribe to the live raw PTY output stream (for a terminal-attach client).

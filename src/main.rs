@@ -68,6 +68,10 @@ const BUF_MAX: usize = 500;
 const QUIESCENCE: Duration = Duration::from_secs(8); // screen must be still this long
 const MIN_TURN: Duration = Duration::from_secs(2); // never complete a turn faster than this
 const MAX_TURN: Duration = Duration::from_secs(600); // hard cap so we never hang forever
+// A per-channel session that has been quiet this long is reaped so procs don't pile up
+// over days. Its resume id is stashed first, so the user's next message in that channel
+// resumes the conversation — reaping is non-destructive (worst case: a re-spawn).
+const IDLE_REAP: Duration = Duration::from_secs(4 * 3600);
 
 struct Monitor {
     sessions: HashMap<String, Session>,
@@ -104,6 +108,21 @@ impl Monitor {
                 .map(|s| format!(" len={}", s.chars().count()))
                 .unwrap_or_default();
             lit_bridge_rs::diag::log("EMIT", &format!("{sess} {ev}{detail}"));
+            // Reflow verification aid: dump the VERBATIM content of streamed body
+            // frames (the reflow scrape) and the JSONL `complete` (the swap-in
+            // authority) for reflow-scoped sessions, so the last `replace` before a
+            // `complete` can be diffed against it. Off unless LIT_BRIDGE_RS_REFLOW_FRAMES.
+            if matches!(ev, "replace" | "complete")
+                && lit_bridge_rs::diag::session_is_reflow_scoped(sess)
+            {
+                if let Some(text) = v
+                    .get("content")
+                    .or_else(|| v.get("text"))
+                    .and_then(|x| x.as_str())
+                {
+                    lit_bridge_rs::diag::log_frame(sess, ev, text);
+                }
+            }
         }
         let mut line = v.to_string();
         line.push('\n');
@@ -704,6 +723,27 @@ impl Monitor {
             }
             s.last = cap;
         }
+
+        // Idle-session reaping — stop per-channel claude procs from accumulating for days.
+        // Collect first (immutable borrow), then remove+kill (mutable). Stash the resume id
+        // so the next message in that channel continues the conversation seamlessly.
+        let now = Instant::now();
+        let idle_keys: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| now.duration_since(s.last_change) > IDLE_REAP)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in idle_keys {
+            if let Some(mut s) = self.sessions.remove(&k) {
+                if let Some(id) = s.session_id() {
+                    self.reaped.insert(k.clone(), id);
+                }
+                s.kill();
+                events.push(json!({"session": k, "event": "reaped_idle"}));
+            }
+        }
+
         for e in events {
             self.emit(e).await;
         }
