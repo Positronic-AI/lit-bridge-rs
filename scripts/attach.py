@@ -36,12 +36,35 @@ if len(sys.argv) < 3:
 
 sock_path, key = sys.argv[1], sys.argv[2]
 
-# Connect. A missing socket means this user/box has no rs bridge — defer to the fallback.
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+# Connect. A missing socket means this user/box has no rs bridge — defer to the
+# fallback. But a socket FILE that exists yet refuses connection is a STALE orphan
+# (a killed bridge that didn't unlink its socket). Don't fail silently on that: say
+# so, and try the canonical /tmp path (the default when XDG_RUNTIME_DIR is unset)
+# before giving up — that's exactly the case where a selector chose a dead socket in
+# the shared runtime dir while the live bridge sits on /tmp.
+def _connect(path):
+    sk = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sk.connect(path)  # raises OSError if the file is missing OR has no live listener
+    return sk
+
 try:
-    s.connect(sock_path)
+    s = _connect(sock_path)
 except OSError:
-    sys.exit(NOT_AVAILABLE)
+    s = None
+    if os.path.exists(sock_path):
+        import getpass
+        alt = "/tmp/lit-bridge-rs-%s.sock.attach" % getpass.getuser()
+        sys.stderr.write(
+            "attach: %s exists but no live bridge (stale socket)%s\n"
+            % (sock_path, ("; trying %s" % alt) if alt != sock_path else "")
+        )
+        if alt != sock_path:
+            try:
+                s = _connect(alt)
+            except OSError:
+                s = None
+    if s is None:
+        sys.exit(NOT_AVAILABLE)
 
 selector = key if key.lstrip().startswith("{") else '{"session":"%s"}' % key
 s.sendall(selector.encode() + b"\n")

@@ -15,7 +15,7 @@ publish = false   # source-available (BSL), not a crates.io package
 [dependencies]
 portable-pty = "0.8"   # ConPTY (Windows) / forkpty (Unix) — proven in the spike
 vt100 = "0.15"         # in-process terminal emulator; the `capture-pane` analogue
-tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time", "sync"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time", "sync", "signal"] }
 serde_json = "1"
 anyhow = "1"
 regex = "1"

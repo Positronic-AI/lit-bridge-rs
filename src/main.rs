@@ -965,7 +965,7 @@ fn arg_opt(flag: &str) -> Option<String> {
 /// the cross-platform path, and the only one available on Windows. Otherwise we
 /// fall back to a Unix socket at `--socket` (attach at `<socket>.attach`), which
 /// is what the Linux local + SSH/socat path expects.
-async fn bind_listeners() -> Result<(Listener, Option<Listener>)> {
+async fn bind_listeners() -> Result<(Listener, Option<Listener>, Vec<String>)> {
     if let Some(port) = arg_opt("--port") {
         let port: u16 = port
             .parse()
@@ -976,7 +976,8 @@ async fn bind_listeners() -> Result<(Listener, Option<Listener>)> {
         if attach.is_some() {
             eprintln!("lit-bridge-rs attach socket on tcp://127.0.0.1:{}", port + 1);
         }
-        return Ok((Listener::Tcp(ctrl), attach.map(Listener::Tcp)));
+        // TCP has no socket files to clean up.
+        return Ok((Listener::Tcp(ctrl), attach.map(Listener::Tcp), Vec::new()));
     }
 
     #[cfg(unix)]
@@ -992,7 +993,7 @@ async fn bind_listeners() -> Result<(Listener, Option<Listener>)> {
         if attach.is_some() {
             eprintln!("lit-bridge-rs attach socket on {attach_path}");
         }
-        Ok((Listener::Unix(ctrl), attach.map(Listener::Unix)))
+        Ok((Listener::Unix(ctrl), attach.map(Listener::Unix), vec![socket, attach_path]))
     }
     #[cfg(not(unix))]
     {
@@ -1006,12 +1007,35 @@ async fn main() -> Result<()> {
     // terminal client connects, sends a one-line session selector, then gets a
     // live bidirectional byte pipe to the PTY — for slash commands, dismissing
     // odd dialogs, and diagnostics when scraping falls short).
-    let (listener, attach_listener) = bind_listeners().await?;
+    let (listener, attach_listener, cleanup_paths) = bind_listeners().await?;
 
     let local = LocalSet::new();
     local
         .run_until(async move {
             let mon = Rc::new(Mutex::new(Monitor::new()));
+
+            // Unlink our socket files on termination. Startup already remove_file()s
+            // before bind, but nothing cleaned up on exit — so a killed daemon left
+            // stale <socket>[.attach] files behind, and anything that selects a socket
+            // by file-existence then connected to a dead endpoint (silent attach fail).
+            // SIGKILL can't be caught, but SIGTERM / Ctrl-C are the common kill paths.
+            #[cfg(unix)]
+            if !cleanup_paths.is_empty() {
+                let paths = cleanup_paths.clone();
+                tokio::task::spawn_local(async move {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+                    let mut intr = signal(SignalKind::interrupt()).expect("SIGINT handler");
+                    tokio::select! {
+                        _ = term.recv() => {}
+                        _ = intr.recv() => {}
+                    }
+                    for p in &paths {
+                        let _ = std::fs::remove_file(p);
+                    }
+                    std::process::exit(0);
+                });
+            }
 
             // Observer task — runs whether or not a client is attached.
             let m2 = mon.clone();
