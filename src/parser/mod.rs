@@ -70,6 +70,25 @@ pub struct TuiState {
     pub errors: Vec<String>,
 }
 
+/// One selectable row of a modal question (`❯ 1. Compact and resume`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DialogOption {
+    /// The key that selects this option in the TUI ("1", "2", …).
+    pub digit: String,
+    pub label: String,
+    /// True for the ❯-highlighted row (what a bare Enter would accept).
+    pub selected: bool,
+}
+
+/// A modal question parsed from the screen, structured enough to relay to a
+/// user as an interactive card and answer back with a keystroke.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DialogQuestion {
+    /// The prompt text above the option list.
+    pub text: String,
+    pub options: Vec<DialogOption>,
+}
+
 /// The contract every CLI TUI parser implements. A parser turns a captured,
 /// VT-rendered screen (the `tmux capture-pane` analogue) into structured state.
 ///
@@ -207,6 +226,15 @@ pub trait TuiParser {
 
     /// If a startup dialog is present, return (detect-substring, dismiss-keys, name).
     fn is_startup_dialog(&self, capture: &str) -> Option<(String, Vec<String>, String)>;
+
+    /// If the screen shows a modal question with an enumerable option list
+    /// (a `❯ N. …` picker — CLI system dialogs and AskUserQuestion alike),
+    /// parse it for relay to the user. `None` means the dialog shape is not
+    /// recognized — callers fall back to `unknown_dialog` + held-message,
+    /// never keystroke into a shape we can't parse.
+    fn parse_dialog_question(&self, _capture: &str) -> Option<DialogQuestion> {
+        None
+    }
 
     /// Full structured parse (state + messages + version + errors).
     fn parse(&self, capture: &str) -> TuiState;

@@ -39,6 +39,22 @@ pub struct Session {
     pub pending_submit: Option<Instant>,
     /// Wall-clock of the last submit-Enter attempt (to space out retries).
     pub last_submit_try: Option<Instant>,
+    /// A message held back because a modal dialog was on screen at dispatch time
+    /// (e.g. the resume-into-full-context compact question). The poll loop pastes
+    /// and submits it when the prompt returns to idle — the message is never
+    /// typed into a dialog and never dropped.
+    pub pending_text: Option<String>,
+    /// When the blocking dialog was first seen (for the held-too-long error).
+    pub dialog_since: Option<Instant>,
+    /// One held-too-long error per blockage.
+    pub dialog_notified: bool,
+    /// True once a structured `question` event was emitted for the current
+    /// dialog (dedup; cleared when the dialog clears).
+    pub question_emitted: bool,
+    /// Set when an `answer` digit was keyed into a dialog: if the dialog is
+    /// still up after a beat, the poll loop follows with Enter to confirm
+    /// (pickers differ on whether a digit selects or select-and-confirms).
+    pub pending_answer_enter: Option<Instant>,
     /// Last TUI-scraped response text emitted as a streaming `replace` (dedup).
     pub last_streamed: String,
     /// The previous turn's final scraped response, captured when `last_streamed`
@@ -220,6 +236,11 @@ impl Session {
             sent: String::new(),
             pending_submit: None,
             last_submit_try: None,
+            pending_text: None,
+            dialog_since: None,
+            dialog_notified: false,
+            question_emitted: false,
+            pending_answer_enter: None,
             last_streamed: String::new(),
             prev_final: String::new(),
             last_thinking: None,

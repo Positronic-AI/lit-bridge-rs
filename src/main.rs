@@ -72,6 +72,25 @@ const MAX_TURN: Duration = Duration::from_secs(600); // hard cap so we never han
 // over days. Its resume id is stashed first, so the user's next message in that channel
 // resumes the conversation — reaping is non-destructive (worst case: a re-spawn).
 const IDLE_REAP: Duration = Duration::from_secs(4 * 3600);
+/// How long a message may sit held behind a modal dialog before the user is told.
+const DIALOG_BLOCK_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Last few non-empty screen lines — enough to identify a dialog in logs/errors.
+fn bottom_excerpt(cap: &str) -> String {
+    let lines: Vec<&str> = cap
+        .lines()
+        .map(|l| l.trim_end())
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    let start = lines.len().saturating_sub(12);
+    let s = lines[start..].join("\n");
+    let n = s.chars().count();
+    if n > 600 {
+        format!("…{}", s.chars().skip(n - 600).collect::<String>())
+    } else {
+        s
+    }
+}
 
 struct Monitor {
     sessions: HashMap<String, Session>,
@@ -194,6 +213,7 @@ impl Monitor {
             "send" => self.cmd_send(mon, &cmd).await,
             "input" => self.cmd_input(&cmd).await,
             "keystroke" => self.cmd_keystroke(&cmd).await,
+            "answer" => self.cmd_answer(&cmd).await,
             "list" => self.cmd_list().await,
             "dump" => self.cmd_dump(&cmd).await,
             "kill" => self.cmd_kill(&cmd).await,
@@ -296,14 +316,63 @@ impl Monitor {
         let key = Self::session_key(cmd);
         let content = cmd.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
         // Baseline the assistant-message count before sending, for completion detection.
-        let baseline = match self.sessions.get(&key) {
-            Some(s) => self.parser.count_assistant_messages(&s.capture()),
+        let (baseline, dialog) = match self.sessions.get(&key) {
+            Some(s) => {
+                let cap = s.capture();
+                let dialog = if self.parser.detect_state(&cap) == SessionState::Dialog {
+                    Some((bottom_excerpt(&cap), self.parser.parse_dialog_question(&cap)))
+                } else {
+                    None
+                };
+                (self.parser.count_assistant_messages(&cap), dialog)
+            }
             None => {
                 self.emit(json!({"session": key, "event": "error", "message": "session not found"}))
                     .await;
                 return;
             }
         };
+        // Never paste into a modal dialog. A resume into a near-full session boots
+        // to the CLI's compact/resume question; pasting there and pressing Enter
+        // accepts whatever option is highlighted (the 2026-07-24 morning
+        // auto-compact). Hold the message — the poll loop dispatches it the moment
+        // the prompt is genuinely idle, and it survives until then.
+        if let Some((excerpt, parsed)) = dialog {
+            let mut emit_question = None;
+            if let Some(s) = self.sessions.get_mut(&key) {
+                s.pending_text = Some(match s.pending_text.take() {
+                    Some(prev) => format!("{prev}\n\n{content}"),
+                    None => content,
+                });
+                if s.dialog_since.is_none() {
+                    s.dialog_since = Some(Instant::now());
+                    s.dialog_notified = false;
+                }
+                // Relay the question as structure (once per dialog) so the UI can
+                // render an answerable card instead of a wait-then-error.
+                if let Some(q) = parsed {
+                    if !s.question_emitted {
+                        s.question_emitted = true;
+                        emit_question = Some(q);
+                    }
+                }
+            }
+            self.emit(json!({"session": key.clone(), "event": "dialog_blocked", "dialog": excerpt}))
+                .await;
+            if let Some(q) = emit_question {
+                let opts: Vec<Value> = q
+                    .options
+                    .iter()
+                    .map(|o| json!({"digit": o.digit, "label": o.label, "selected": o.selected}))
+                    .collect();
+                self.emit(json!({
+                    "session": key, "event": "question", "source": "cli-dialog",
+                    "text": q.text, "options": opts
+                }))
+                .await;
+            }
+            return;
+        }
         let outcome = match self.sessions.get_mut(&key) {
             Some(s) => {
                 s.baseline_msgs = baseline;
@@ -384,6 +453,47 @@ impl Monitor {
         } else {
             self.emit(json!({"session": key, "event": "error", "message": "session not found"}))
                 .await;
+        }
+    }
+
+    /// Answer a modal dialog by option digit — the deliberate counterpart of the
+    /// blind Enter this bridge refuses to press. The mux resolves a user's card
+    /// click (or matching typed reply) to a digit; we key it, and the poll loop
+    /// follows with Enter if the picker needs a confirm.
+    async fn cmd_answer(&mut self, cmd: &Value) {
+        let key = Self::session_key(cmd);
+        let digit = cmd
+            .get("digit")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let valid = digit.len() == 1 && digit.chars().all(|c| c.is_ascii_digit());
+        let outcome = match self.sessions.get_mut(&key) {
+            Some(s) if valid => {
+                if s.state != SessionState::Dialog {
+                    Err("no dialog is waiting on this session".to_string())
+                } else {
+                    match s.send_key(&digit) {
+                        Ok(()) => {
+                            s.pending_answer_enter = Some(Instant::now());
+                            Ok(())
+                        }
+                        Err(e) => Err(format!("answer failed: {e}")),
+                    }
+                }
+            }
+            Some(_) => Err(format!("invalid answer digit: {digit:?}")),
+            None => Err("session not found".to_string()),
+        };
+        match outcome {
+            Ok(()) => {
+                self.emit(json!({"session": key, "event": "answer_sent", "digit": digit}))
+                    .await
+            }
+            Err(m) => {
+                self.emit(json!({"session": key, "event": "error", "message": m}))
+                    .await
+            }
         }
     }
 
@@ -485,7 +595,104 @@ impl Monitor {
                     "from": s.state.as_str(),
                     "to": new_state.as_str()
                 }));
+                if new_state == SessionState::Dialog {
+                    // A dialog appeared mid-turn (AskUserQuestion) or over a held
+                    // message: relay it as structure if the shape is parseable,
+                    // else log it for the corpus. Startup dialogs (neither
+                    // observing nor holding) stay with the spawn-time dismisser.
+                    if (s.observing || s.pending_text.is_some()) && !s.question_emitted {
+                        match self.parser.parse_dialog_question(&cap) {
+                            Some(q) => {
+                                s.question_emitted = true;
+                                let opts: Vec<Value> = q
+                                    .options
+                                    .iter()
+                                    .map(|o| json!({"digit": o.digit, "label": o.label, "selected": o.selected}))
+                                    .collect();
+                                events.push(json!({
+                                    "session": s.name.clone(), "event": "question",
+                                    "source": "cli-dialog", "text": q.text, "options": opts
+                                }));
+                            }
+                            None => events.push(json!({
+                                "session": s.name.clone(), "event": "unknown_dialog",
+                                "dialog": bottom_excerpt(&cap)
+                            })),
+                        }
+                    }
+                } else if s.state == SessionState::Dialog {
+                    // Dialog resolved (answered, dismissed, or timed out upstream).
+                    s.question_emitted = false;
+                    s.pending_answer_enter = None;
+                    events.push(json!({"session": s.name.clone(), "event": "dialog_cleared"}));
+                }
                 s.state = new_state;
+            }
+            // Answer follow-up: a digit was keyed into the dialog; if it only
+            // moved the selection (dialog still up after a beat), confirm with
+            // Enter — the one place Enter-into-a-dialog is a *chosen* action.
+            if let Some(keyed_at) = s.pending_answer_enter {
+                if new_state != SessionState::Dialog {
+                    s.pending_answer_enter = None;
+                } else if keyed_at.elapsed() > Duration::from_millis(400) {
+                    let _ = s.send_enter();
+                    s.pending_answer_enter = None;
+                }
+            }
+            // Held-message dispatch: a message that arrived while a modal dialog
+            // was on screen (cmd_send's dialog gate) waits here instead of being
+            // pasted into the dialog. Dispatch the moment the prompt is genuinely
+            // idle. If the dialog lingers, surface one actionable error to the
+            // stream — but KEEP holding, so the message is delivered whenever the
+            // dialog gets resolved (terminal attach, auto-dismiss, …). Never eaten.
+            if s.pending_text.is_some() {
+                if new_state == SessionState::Idle {
+                    let content = s.pending_text.take().unwrap();
+                    s.dialog_since = None;
+                    s.dialog_notified = false;
+                    s.baseline_msgs = self.parser.count_assistant_messages(&cap);
+                    s.observing = true;
+                    s.prev_final = std::mem::take(&mut s.last_streamed);
+                    s.sent = content.clone();
+                    s.begin_turn();
+                    match s.send_text(&content) {
+                        Ok(()) => {
+                            if !s.win32_active() {
+                                s.pending_submit = Some(Instant::now());
+                                s.last_submit_try = None;
+                            }
+                            let old = s.state;
+                            s.state = SessionState::Thinking;
+                            events.push(json!({"session": s.name.clone(), "event": "dialog_released"}));
+                            events.push(json!({
+                                "session": s.name.clone(), "event": "state",
+                                "from": old.as_str(), "to": "thinking"
+                            }));
+                        }
+                        Err(e) => {
+                            s.observing = false;
+                            events.push(json!({
+                                "session": s.name.clone(), "event": "error",
+                                "message": format!("send failed: {e}")
+                            }));
+                        }
+                    }
+                } else if let Some(since) = s.dialog_since {
+                    // When a structured question card is out, the card is the
+                    // surface — no timer error on top of it. The error remains
+                    // for UNPARSEABLE dialogs, where the card couldn't be shown.
+                    if !s.question_emitted && !s.dialog_notified && since.elapsed() > DIALOG_BLOCK_TIMEOUT {
+                        s.dialog_notified = true;
+                        events.push(json!({
+                            "session": s.name.clone(), "event": "error",
+                            "message": format!(
+                                "Message held — the session is showing a dialog that needs an answer \
+                                 (open the terminal to respond; the message sends once it clears):\n{}",
+                                bottom_excerpt(&cap)
+                            )
+                        }));
+                    }
+                }
             }
             // Submit-with-verification. The bracketed paste lands the full message
             // in the prompt within a few hundred ms; then press Enter (retry,
@@ -495,10 +702,19 @@ impl Monitor {
             // the blinking cursor means the screen never "settles". Stop once a new
             // assistant message appears (the turn really started) or the prompt
             // leaves idle after we've pressed Enter.
+            //
+            // ONE state exception: a modal dialog. Enter has selection semantics
+            // there — a blind Enter accepts whatever option is highlighted (that's
+            // how the 2026-07-24 morning auto-compact happened). While a dialog is
+            // up: no Enter, no "turn started" inference, and the retry window is
+            // re-armed so submission resumes cleanly if the dialog clears.
             if let Some(pasted_at) = s.pending_submit {
                 let turn_started =
                     self.parser.count_assistant_messages(&cap) > s.baseline_msgs;
-                if turn_started
+                let in_dialog = new_state == SessionState::Dialog;
+                if in_dialog {
+                    s.pending_submit = Some(Instant::now()); // re-arm; never Enter into a dialog
+                } else if turn_started
                     || (new_state != SessionState::Idle && s.last_submit_try.is_some())
                 {
                     s.pending_submit = None; // submitted — turn under way
@@ -739,6 +955,18 @@ impl Monitor {
                 if let Some(id) = s.session_id() {
                     self.reaped.insert(k.clone(), id);
                 }
+                // A message still held behind an unresolved dialog dies with the
+                // process — say so instead of losing it silently.
+                if let Some(held) = s.pending_text.take() {
+                    let preview: String = held.chars().take(120).collect();
+                    events.push(json!({
+                        "session": k.clone(), "event": "error",
+                        "message": format!(
+                            "Session reaped while a message was still held behind an \
+                             unanswered dialog — it was NOT delivered: {preview}…"
+                        )
+                    }));
+                }
                 s.kill();
                 events.push(json!({"session": k, "event": "reaped_idle"}));
             }
@@ -833,6 +1061,27 @@ async fn finalize_create(
             break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Telemetry: giving up with a modal still on screen means an UNRECOGNIZED
+    // dialog (e.g. the resume-into-full-context compact question) — log its text
+    // so the next new dialog doesn't need an eyewitness at the terminal.
+    // cmd_send's dialog gate holds any message dispatched while it's up.
+    let lingering = {
+        let m = mon.lock().await;
+        m.sessions.get(&key).map(|s| s.capture()).and_then(|cap| {
+            if m.parser.detect_state(&cap) == SessionState::Dialog {
+                Some(bottom_excerpt(&cap))
+            } else {
+                None
+            }
+        })
+    };
+    if let Some(excerpt) = lingering {
+        mon.lock()
+            .await
+            .emit(json!({"session": key.clone(), "event": "unknown_dialog", "dialog": excerpt}))
+            .await;
     }
 
     mon.lock()
@@ -1073,4 +1322,86 @@ async fn main() -> Result<()> {
             Ok::<(), anyhow::Error>(())
         })
         .await
+}
+
+#[cfg(test)]
+mod dialog_gate_tests {
+    use super::*;
+
+    /// The screen the 2026-07-24 morning incident booted into: `--resume` of a
+    /// near-full session presents a numbered-option question. The dispatch gate
+    /// and the Enter-retry exception both key on detect_state == Dialog, so this
+    /// shape MUST classify as Dialog — never Idle.
+    #[test]
+    fn resume_compact_question_is_dialog_state() {
+        let parser = select_parser("claude-code").unwrap();
+        let cap = "\
+ Claude Code v2.1.0
+
+ This conversation is large and may be expensive to resume.
+
+ ❯ 1. Compact and resume (recommended)
+   2. Resume without compacting
+   3. Start a new session
+
+ Enter to confirm · Esc to cancel
+";
+        assert_eq!(parser.detect_state(cap), SessionState::Dialog);
+    }
+
+    #[test]
+    fn resume_dialog_parses_to_structured_question() {
+        let parser = select_parser("claude-code").unwrap();
+        let cap = "\
+ This conversation is large and may be expensive to resume.
+
+ ❯ 1. Compact and resume (recommended)
+   2. Resume without compacting
+   3. Start a new session
+
+ Enter to confirm · Esc to cancel
+";
+        let q = parser.parse_dialog_question(cap).expect("should parse");
+        assert_eq!(q.text, "This conversation is large and may be expensive to resume.");
+        assert_eq!(q.options.len(), 3);
+        assert!(q.options[0].selected);
+        assert_eq!(q.options[0].digit, "1");
+        assert_eq!(q.options[1].label, "Resume without compacting");
+        assert!(!q.options[2].selected);
+    }
+
+    #[test]
+    fn bordered_picker_parses_and_bad_shapes_refuse() {
+        let parser = select_parser("claude-code").unwrap();
+        let bordered = "\
+╭──────────────────────────────────╮
+│ Which database should we use?    │
+│ ❯ 1. PostgreSQL                  │
+│   2. SQLite                      │
+╰──────────────────────────────────╯
+";
+        let q = parser.parse_dialog_question(bordered).expect("should parse");
+        assert_eq!(q.text, "Which database should we use?");
+        assert_eq!(q.options[1].label, "SQLite");
+
+        // Numbering that doesn't start at 1 is prose, not a picker.
+        assert!(parser
+            .parse_dialog_question(" 3. a step\n 4. another step\n")
+            .is_none());
+        // A single numbered line is not a picker.
+        assert!(parser.parse_dialog_question(" 1. only one\n").is_none());
+    }
+
+    #[test]
+    fn bottom_excerpt_takes_last_lines_and_caps_length() {
+        let mut cap = String::new();
+        for i in 0..40 {
+            cap.push_str(&format!("line {i}\n"));
+        }
+        let ex = bottom_excerpt(&cap);
+        assert!(ex.contains("line 39"));
+        assert!(!ex.contains("line 10"));
+        let long = "x".repeat(2000);
+        assert!(bottom_excerpt(&long).chars().count() <= 601);
+    }
 }

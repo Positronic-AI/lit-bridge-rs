@@ -10,7 +10,9 @@
 
 use regex::Regex;
 
-use crate::parser::{SessionState, TuiContentBlock, TuiMessage, TuiParser, TuiState};
+use crate::parser::{
+    DialogOption, DialogQuestion, SessionState, TuiContentBlock, TuiMessage, TuiParser, TuiState,
+};
 
 /// Startup dialogs: (detect-substring, dismiss-keys, name)
 const STARTUP_DIALOGS: &[(&str, &[&str], &str)] = &[
@@ -41,6 +43,7 @@ pub struct ClaudeV21Parser {
     re_tool_call_start: Regex,
     re_conversation_picker: Regex,
     re_compact_progress: Regex,
+    re_dialog_option: Regex,
 }
 
 impl Default for ClaudeV21Parser {
@@ -67,6 +70,7 @@ impl ClaudeV21Parser {
             )
             .unwrap(),
             re_compact_progress: Regex::new(r"^\d+%\s+until\s+auto-compact").unwrap(),
+            re_dialog_option: Regex::new(r"^\s*(❯\s*)?(\d)[.)]\s+(.+)$").unwrap(),
         }
     }
 
@@ -686,6 +690,104 @@ impl TuiParser for ClaudeV21Parser {
         None
     }
 
+    fn parse_dialog_question(&self, capture: &str) -> Option<DialogQuestion> {
+        // Strip box-drawing borders so bordered dialogs parse the same as bare
+        // ones; border-only rows collapse to empty/dash lines and are skipped.
+        let cleaned: Vec<String> = capture
+            .lines()
+            .map(|l| {
+                l.trim_end()
+                    .trim_start_matches(|c| c == '│' || c == '┃' || c == ' ')
+                    .trim_end_matches(|c| c == '│' || c == '┃' || c == ' ')
+                    .to_string()
+            })
+            .collect();
+
+        // Option rows are NOT necessarily contiguous: AskUserQuestion draws a
+        // description line under each row, and a footer rule separates the real
+        // options from trailing chrome ("Chat about this"). So collect every
+        // `❯? N.` row, then group into sequences whose digits increment 1,2,3,…
+        // with no separator/status line breaking the chain. The live picker is
+        // the last such sequence that starts at 1 (numbered prose scrolled above
+        // forms earlier sequences); a boundary line ends a sequence, which is
+        // what drops the "Chat about this" row below the picker's footer rule.
+        let is_boundary =
+            |t: &str| self.re_separator.is_match(t) || self.re_status.is_match(t);
+
+        let mut rows: Vec<(usize, DialogOption)> = Vec::new();
+        for (i, line) in cleaned.iter().enumerate() {
+            if let Some(caps) = self.re_dialog_option.captures(line) {
+                rows.push((
+                    i,
+                    DialogOption {
+                        digit: caps[2].to_string(),
+                        label: caps[3].trim().to_string(),
+                        selected: caps.get(1).is_some(),
+                    },
+                ));
+            }
+        }
+
+        let mut sequences: Vec<(usize, Vec<DialogOption>)> = Vec::new();
+        let mut prev_digit = 0i32;
+        let mut prev_idx: Option<usize> = None;
+        for (idx, opt) in rows {
+            let d: i32 = opt.digit.parse().unwrap_or(-1);
+            let broken = prev_idx.map_or(true, |p| {
+                d != prev_digit + 1
+                    || cleaned[p + 1..idx].iter().any(|l| is_boundary(l.trim()))
+            });
+            if broken {
+                sequences.push((idx, vec![opt]));
+            } else {
+                sequences.last_mut().unwrap().1.push(opt);
+            }
+            prev_digit = d;
+            prev_idx = Some(idx);
+        }
+
+        // A real picker numbers from 1 with ≥2 consecutive options; the
+        // increment-by-one grouping already guarantees the digits are unique.
+        let (start, options) = sequences
+            .into_iter()
+            .rev()
+            .find(|(_, opts)| opts.len() >= 2 && opts[0].digit == "1")?;
+
+        // Question text: the non-empty lines directly above the options, stopping
+        // at anything that reads as conversation/chrome rather than dialog prose.
+        let mut text_lines: Vec<&str> = Vec::new();
+        for line in cleaned[..start].iter().rev() {
+            let t = line.trim();
+            if t.is_empty() {
+                if text_lines.is_empty() {
+                    continue;
+                }
+                break;
+            }
+            let border_only = t
+                .chars()
+                .all(|c| matches!(c, '─' | '╭' | '╮' | '╰' | '╯' | '├' | '┤' | '┬' | '┴' | '-' | '='));
+            if t.starts_with('●')
+                || t.starts_with('⎿')
+                || t.starts_with('✻')
+                || border_only
+                || self.re_separator.is_match(t)
+                || self.re_status.is_match(t)
+            {
+                break;
+            }
+            text_lines.push(t);
+            if text_lines.len() >= 6 {
+                break;
+            }
+        }
+        text_lines.reverse();
+        Some(DialogQuestion {
+            text: text_lines.join("\n"),
+            options,
+        })
+    }
+
     fn parse(&self, capture: &str) -> TuiState {
         let state = self.detect_state(capture);
         let messages = self.extract_messages(capture);
@@ -710,3 +812,4 @@ impl TuiParser for ClaudeV21Parser {
         }
     }
 }
+
