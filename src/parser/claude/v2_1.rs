@@ -44,6 +44,7 @@ pub struct ClaudeV21Parser {
     re_conversation_picker: Regex,
     re_compact_progress: Regex,
     re_dialog_option: Regex,
+    re_progress_bar: Regex,
 }
 
 impl Default for ClaudeV21Parser {
@@ -71,6 +72,11 @@ impl ClaudeV21Parser {
             .unwrap(),
             re_compact_progress: Regex::new(r"^\d+%\s+until\s+auto-compact").unwrap(),
             re_dialog_option: Regex::new(r"^\s*(❯\s*)?(\d)[.)]\s+(.+)$").unwrap(),
+            // A standalone progress bar under a spinner (compaction): bar glyphs
+            // (any non-alphanumeric run — glyph choice varies by version) ending
+            // in a bare percentage. Letters exclude chrome like "N% until
+            // auto-compact" and "context used".
+            re_progress_bar: Regex::new(r"^[^0-9A-Za-z]*\d{1,3}%$").unwrap(),
         }
     }
 
@@ -249,10 +255,22 @@ impl TuiParser for ClaudeV21Parser {
         // reach real output — a response bullet `●` or a `✻` completion marker —
         // before any spinner (the spinner always carries `…`, so a settled `✻`
         // line without one is correctly read as content, not a spinner).
+        //
+        // A progress bar can sit below the spinner (compaction: `▰▰▱▱ 17%`).
+        // Bottom-up it's seen first — remember it and append it to the spinner
+        // line so the relay carries the whole animation, not just the tick.
+        let mut progress: Option<&str> = None;
         for line in capture.split('\n').rev() {
             let s = line.trim();
             if self.re_spinner_active.is_match(s) {
-                return Some(s.to_string());
+                return Some(match progress {
+                    Some(p) => format!("{s}  {p}"),
+                    None => s.to_string(),
+                });
+            }
+            if progress.is_none() && self.re_progress_bar.is_match(s) {
+                progress = Some(s);
+                continue;
             }
             if self.re_response.is_match(s) || self.re_completion.is_match(s) {
                 return None;

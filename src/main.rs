@@ -646,7 +646,14 @@ impl Monitor {
             // stream — but KEEP holding, so the message is delivered whenever the
             // dialog gets resolved (terminal attach, auto-dismiss, …). Never eaten.
             if s.pending_text.is_some() {
-                if new_state == SessionState::Idle {
+                // A busy spinner (e.g. the compaction after "Resume from summary")
+                // classifies as Idle — the prompt box is back on screen — but the
+                // CLI isn't genuinely ready: pasting there queues the text
+                // invisibly and the Enter retries poke a busy TUI. Spinner-active
+                // counts as not-yet-idle: keep holding, and relay the live
+                // animation below so the web sees what the terminal sees.
+                let busy_spinner = self.parser.extract_spinner_line(&cap);
+                if new_state == SessionState::Idle && busy_spinner.is_none() {
                     let content = s.pending_text.take().unwrap();
                     s.dialog_since = None;
                     s.dialog_notified = false;
@@ -677,20 +684,38 @@ impl Monitor {
                             }));
                         }
                     }
-                } else if let Some(since) = s.dialog_since {
-                    // When a structured question card is out, the card is the
-                    // surface — no timer error on top of it. The error remains
-                    // for UNPARSEABLE dialogs, where the card couldn't be shown.
-                    if !s.question_emitted && !s.dialog_notified && since.elapsed() > DIALOG_BLOCK_TIMEOUT {
-                        s.dialog_notified = true;
-                        events.push(json!({
-                            "session": s.name.clone(), "event": "error",
-                            "message": format!(
-                                "Message held — the session is showing a dialog that needs an answer \
-                                 (open the terminal to respond; the message sends once it clears):\n{}",
-                                bottom_excerpt(&cap)
-                            )
-                        }));
+                } else {
+                    // Held-window spinner relay: the dialog was answered but the
+                    // CLI is still busy before the turn can start — e.g. the
+                    // compaction after "Resume from summary". `observing` isn't on
+                    // yet, so the normal spinner relay below can't run; without
+                    // this the web shows dead air for the whole compaction while
+                    // the terminal animates.
+                    if new_state != SessionState::Dialog {
+                        if let Some(spin) = busy_spinner {
+                            if s.last_thinking.as_deref() != Some(spin.as_str()) {
+                                events.push(json!({
+                                    "session": s.name.clone(), "event": "thinking", "text": spin.clone()
+                                }));
+                                s.last_thinking = Some(spin);
+                            }
+                        }
+                    }
+                    if let Some(since) = s.dialog_since {
+                        // When a structured question card is out, the card is the
+                        // surface — no timer error on top of it. The error remains
+                        // for UNPARSEABLE dialogs, where the card couldn't be shown.
+                        if !s.question_emitted && !s.dialog_notified && since.elapsed() > DIALOG_BLOCK_TIMEOUT {
+                            s.dialog_notified = true;
+                            events.push(json!({
+                                "session": s.name.clone(), "event": "error",
+                                "message": format!(
+                                    "Message held — the session is showing a dialog that needs an answer \
+                                     (open the terminal to respond; the message sends once it clears):\n{}",
+                                    bottom_excerpt(&cap)
+                                )
+                            }));
+                        }
                     }
                 }
             }
@@ -1368,6 +1393,45 @@ mod dialog_gate_tests {
         assert_eq!(q.options[0].digit, "1");
         assert_eq!(q.options[1].label, "Resume without compacting");
         assert!(!q.options[2].selected);
+    }
+
+    /// The compaction screen after answering "Resume from summary": spinner verb
+    /// line with a progress bar beneath. The held-window relay depends on the
+    /// extractor returning both — the ticking verb AND the bar — as one line.
+    #[test]
+    fn compaction_spinner_extracts_with_progress_bar() {
+        let parser = select_parser("claude-code").unwrap();
+        let cap = "\
+ ❯ /compact
+
+ · Compacting conversation… (16s)
+ ▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱ 17%
+
+ ⏵⏵ bypass permissions on (shift+tab to cycle)
+";
+        let spin = parser.extract_spinner_line(cap).expect("spinner");
+        assert!(spin.contains("Compacting conversation"));
+        assert!(spin.contains("17%"));
+        // This screen classifies as Idle (the prompt box is back) — the
+        // held-message gate must therefore ALSO check the spinner, or the
+        // held text would paste mid-compaction. The gate is
+        // `Idle && extract_spinner_line().is_none()`; this fixture proves the
+        // spinner side holds it.
+        assert_eq!(parser.detect_state(cap), SessionState::Idle);
+    }
+
+    /// A plain think-gap spinner (no bar) still extracts unchanged, and chrome
+    /// like the auto-compact countdown is never mistaken for a progress bar.
+    #[test]
+    fn plain_spinner_extracts_without_progress_suffix() {
+        let parser = select_parser("claude-code").unwrap();
+        let cap = "\
+ ✽ Thinking… (esc to interrupt · 3s)
+
+ 42% until auto-compact
+";
+        let spin = parser.extract_spinner_line(cap).expect("spinner");
+        assert_eq!(spin, "✽ Thinking… (esc to interrupt · 3s)");
     }
 
     #[test]
