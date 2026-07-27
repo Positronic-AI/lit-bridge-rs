@@ -7,7 +7,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.2] — 2026-07-27
+
+Everything since the initial preview: Windows-native maturity, live-stream parity
+with the terminal, structured dialog relay, and reflow foundations.
+
 ### Added
+- **Dialog relay**: modal questions (CLI system dialogs, resume/compact pickers) are
+  detected, parsed into structured `question` events (digit-continuity option
+  grouping), and answered back over the pipe as digit presses — held messages
+  dispatch when the dialog clears, and Enter is never blindly pressed into a picker.
+- **Compaction visibility**: the spinner + progress bar (`Compacting conversation…
+  ▰▰▱▱ 17%`) relay as `thinking` events during the held-message window, and the
+  dispatch gate is now `Idle && no active spinner` — never paste into a busy TUI.
+- **Live spinner parity**: pre-body think-gap and mid-turn tool-gap spinner verbs
+  stream to the client verbatim (web shows the same shimmer as the terminal).
+- **Per-turn token usage** captured from the JSONL and forwarded on `complete`.
+- **Organic turns**: un-observed (background) turns relay to the channel store.
+- **Reflow** (opt-in, `LIT_BRIDGE_RS_REFLOW=<channel>`): un-wrap the Ink-rendered
+  TUI grid into logical prose, scoped to a single channel for evaluation.
 - **TCP-loopback transport** for native Windows (where Unix sockets aren't available):
   `--port` flag, control channel on N and raw-PTY attach on N+1, boxed async read/write
   halves behind a `Listener` enum (`#[cfg(unix)]` Unix arm + always-present TCP arm).
@@ -23,6 +41,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `end_turn` entry is never eaten by a partial read (was causing permanent stuck-open
   hangs on thinking→text straddles); defer `turn_complete` when an `end_turn` arrives
   with empty parts, awaiting the following text block, instead of firing prematurely.
+- Windows submission hardening: bracketed paste for multi-line input, Ctrl+J
+  newlines, submit-with-verification via the poll loop (Enter retried until the
+  turn starts, never into a dialog), correct project-dir slug, bypass-permissions
+  dialog dismissed via digit quick-select.
+- Session hygiene: unlink sockets on exit + self-heal attach past a stale socket;
+  reap killed children and idle sessions; self-rotate the diagnostic event log at
+  64 MiB; re-anchor dormant-channel rolls by pin-time snapshot; mid-turn session
+  roll + durable stale-frame gate (no more previous-response flash); don't freeze
+  the live stream when the response bullet scrolls offscreen.
 
 ## [0.0.1] — 2026-06-16
 
