@@ -1142,15 +1142,39 @@ async fn handle_attach(mon: Rc<Mutex<Monitor>>, mut rh: BoxRead, mut wh: BoxWrit
         }
     }
     let sel_str = String::from_utf8_lossy(&sel);
-    let key = match serde_json::from_str::<Value>(sel_str.trim()) {
-        Ok(v) => {
+    let parsed = serde_json::from_str::<Value>(sel_str.trim()).ok();
+
+    // Diagnostic selector: {"list":true} (or the bare word "list") enumerates the
+    // daemon's sessions and closes — the control socket can't serve this ad hoc
+    // because the mux holds it exclusively. Used by scripts/sessions.py.
+    let want_list = sel_str.trim() == "list"
+        || parsed
+            .as_ref()
+            .and_then(|v| v.get("list"))
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+    if want_list {
+        let m = mon.lock().await;
+        let list: Vec<Value> = m
+            .sessions
+            .values()
+            .map(|s| json!({"name": s.name, "state": s.state.as_str(), "model": s.model}))
+            .collect();
+        let reply = json!({"pid": std::process::id(), "sessions": list});
+        let _ = wh.write_all(reply.to_string().as_bytes()).await;
+        let _ = wh.write_all(b"\n").await;
+        return;
+    }
+
+    let key = match parsed {
+        Some(v) => {
             let name = v.get("session").and_then(|x| x.as_str()).unwrap_or("");
             match v.get("channel_id").and_then(|x| x.as_str()) {
                 Some(c) => format!("{name}:{c}"),
                 None => name.to_string(),
             }
         }
-        Err(_) => sel_str.trim().to_string(),
+        None => sel_str.trim().to_string(),
     };
 
     // Subscribe to live output + grab the current screen for the initial paint.
@@ -1161,8 +1185,18 @@ async fn handle_attach(mon: Rc<Mutex<Monitor>>, mut rh: BoxRead, mut wh: BoxWrit
         match m.sessions.get(&key) {
             Some(s) => (s.subscribe(), s.capture_formatted()),
             None => {
+                // Echo what the daemon DOES have — a failed attach that names the
+                // live keys turns "mystery" into "typo'd key" or "wrong daemon".
+                let have: Vec<&str> = m.sessions.keys().map(|k| k.as_str()).collect();
                 let _ = wh
-                    .write_all(format!("\r\nlit-bridge-rs: no such session '{key}'\r\n").as_bytes())
+                    .write_all(
+                        format!(
+                            "\r\nlit-bridge-rs: no such session '{key}' (pid {} has: [{}])\r\n",
+                            std::process::id(),
+                            have.join(", ")
+                        )
+                        .as_bytes(),
+                    )
                     .await;
                 return;
             }

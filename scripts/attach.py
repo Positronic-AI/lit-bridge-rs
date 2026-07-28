@@ -77,6 +77,8 @@ r, _, _ = select.select([s], [], [], 2.0)
 if r:
     first = s.recv(65536)
     if not first or b"no such session" in first:
+        why = "bridge reports no such session" if first else "bridge closed the connection without data"
+        print(f"attach: {why} for '{key}'", file=sys.stderr)
         sys.exit(NOT_AVAILABLE)
 
 old = termios.tcgetattr(0)
