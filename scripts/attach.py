@@ -67,16 +67,71 @@ except OSError:
         sys.exit(NOT_AVAILABLE)
 
 selector = key if key.lstrip().startswith("{") else '{"session":"%s"}' % key
+
+
+def _peek(sk):
+    """First read after sending the selector: session screen, or a rejection."""
+    r, _, _ = select.select([sk], [], [], 2.0)
+    if not r:
+        return b""
+    return sk.recv(65536)
+
+
+def _rejected(first):
+    """True iff the daemon refused the attach. Match the exact rejection preamble —
+    a bare substring test false-positives when the session's own SCREEN contains the
+    words "no such session" (e.g. while debugging this very tooling)."""
+    return first.startswith(b"\r\nlit-bridge-rs: no such session")
+
+
+def _find_elsewhere(tried_path):
+    """A live daemon may exist on another socket (XDG vs /tmp vs desktop) and hold
+    the session. Ask each candidate with {"list":true} and return the first match."""
+    import getpass
+    import json
+    user = getpass.getuser()
+    cands = []
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        cands.append(os.path.join(xdg, "lit-bridge-rs-%s.sock.attach" % user))
+    cands.append("/tmp/lit-bridge-rs-%s.sock.attach" % user)
+    cands.append(os.path.expanduser(
+        "~/.local/share/lit-desktop/run/lit-bridge-rs-%s.sock.attach" % user))
+    plain = key if not key.lstrip().startswith("{") else None
+    for path in cands:
+        if path == tried_path or not os.path.exists(path):
+            continue
+        try:
+            sk = _connect(path)
+            sk.sendall(b'{"list":true}\n')
+            r, _, _ = select.select([sk], [], [], 2.0)
+            buf = sk.recv(65536) if r else b""
+            sk.close()
+            info = json.loads(buf.decode())
+        except (OSError, ValueError):
+            continue
+        if plain and any(x.get("name") == plain for x in info.get("sessions", [])):
+            return path
+    return None
+
+
 s.sendall(selector.encode() + b"\n")
 
 # Peek before touching the terminal: a real session paints its screen immediately; a
 # missing one gets "no such session" and a closed socket. Resolve which BEFORE raw mode so
 # a fallback (tmux attach) inherits a clean terminal.
-first = b""
-r, _, _ = select.select([s], [], [], 2.0)
-if r:
-    first = s.recv(65536)
-    if not first or b"no such session" in first:
+first = _peek(s)
+if not first or _rejected(first):
+    # This daemon is live but doesn't hold the session — another daemon might
+    # (e.g. attach preferred the XDG socket while the session lives on /tmp).
+    alt = _find_elsewhere(sock_path)
+    if alt:
+        sys.stderr.write("attach: session not on %s; found on %s\n" % (sock_path, alt))
+        s.close()
+        s = _connect(alt)
+        s.sendall(selector.encode() + b"\n")
+        first = _peek(s)
+    if not first or _rejected(first):
         why = "bridge reports no such session" if first else "bridge closed the connection without data"
         print(f"attach: {why} for '{key}'", file=sys.stderr)
         sys.exit(NOT_AVAILABLE)
