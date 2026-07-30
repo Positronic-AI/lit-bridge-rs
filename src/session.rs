@@ -44,6 +44,14 @@ pub struct Session {
     /// and submits it when the prompt returns to idle — the message is never
     /// typed into a dialog and never dropped.
     pub pending_text: Option<String>,
+    /// Set once the CLI enables bracketed paste (ESC[?2004h) — the authoritative
+    /// "input layer is live" beacon. Sending before this races the TUI's boot:
+    /// the paste markers get eaten as literal text and the CLI receives a
+    /// fragment (the 2026-07-30 "your message just says '2'" — the 2 of 200~).
+    /// cmd_send holds messages until this is set; the poll loop delivers them.
+    pub paste_ready: Arc<AtomicBool>,
+    /// Spawn wall-clock — the paste gate's fallback ceiling measures from here.
+    pub spawned_at: Instant,
     /// When the blocking dialog was first seen (for the held-too-long error).
     pub dialog_since: Option<Instant>,
     /// One held-too-long error per blockage.
@@ -174,10 +182,12 @@ impl Session {
         let (output_tx, _) = broadcast::channel::<Vec<u8>>(512);
         let mut reader = pair.master.try_clone_reader()?;
         let win32 = Arc::new(AtomicBool::new(false));
+        let paste_ready = Arc::new(AtomicBool::new(false));
         {
             let s = screen.clone();
             let tee = output_tx.clone();
             let win32_r = win32.clone();
+            let paste_r = paste_ready.clone();
             // Diagnostic: dump raw PTY output to a file when LIT_BRIDGE_RS_RAWLOG is set.
             // Inert in production; used to inspect the CLI's terminal-capability handshake.
             let raw_log = std::env::var("LIT_BRIDGE_RS_RAWLOG").ok();
@@ -199,6 +209,12 @@ impl Session {
                             }
                             if chunk.windows(8).any(|w| w == b"\x1b[?9001l") {
                                 win32_r.store(false, Ordering::Relaxed);
+                            }
+                            // Bracketed-paste enable = the CLI's input layer is live.
+                            // (Chunk-boundary splits are possible but rare; the poll
+                            // loop's age fallback covers a missed sighting.)
+                            if chunk.windows(8).any(|w| w == b"\x1b[?2004h") {
+                                paste_r.store(true, Ordering::Relaxed);
                             }
                             if let Some(f) = log.as_mut() {
                                 let _ = f.write_all(chunk);
@@ -237,6 +253,8 @@ impl Session {
             pending_submit: None,
             last_submit_try: None,
             pending_text: None,
+            paste_ready,
+            spawned_at: Instant::now(),
             dialog_since: None,
             dialog_notified: false,
             question_emitted: false,

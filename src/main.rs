@@ -373,6 +373,30 @@ impl Monitor {
             }
             return;
         }
+        // Startup paste gate: never type into a CLI that hasn't enabled bracketed
+        // paste yet (ESC[?2004h = its input layer is live). A send that wins that
+        // race gets its paste markers eaten as literal text and the CLI receives a
+        // fragment — the cold-spawn "first message vanishes" failure. Hold the
+        // message; the poll loop delivers it the moment the beacon appears (or
+        // after the age ceiling, as a never-strand fallback).
+        let paste_pending = self
+            .sessions
+            .get(&key)
+            .map(|s| {
+                !s.paste_ready.load(std::sync::atomic::Ordering::Relaxed)
+                    && s.spawned_at.elapsed() < Duration::from_secs(30)
+            })
+            .unwrap_or(false);
+        if paste_pending {
+            if let Some(s) = self.sessions.get_mut(&key) {
+                s.pending_text = Some(match s.pending_text.take() {
+                    Some(prev) => format!("{prev}\n\n{content}"),
+                    None => content,
+                });
+            }
+            self.emit(json!({"session": key, "event": "startup_hold"})).await;
+            return;
+        }
         let outcome = match self.sessions.get_mut(&key) {
             Some(s) => {
                 s.baseline_msgs = baseline;
@@ -653,7 +677,12 @@ impl Monitor {
                 // counts as not-yet-idle: keep holding, and relay the live
                 // animation below so the web sees what the terminal sees.
                 let busy_spinner = self.parser.extract_spinner_line(&cap);
-                if new_state == SessionState::Idle && busy_spinner.is_none() {
+                // Startup paste gate (see cmd_send): a held message also waits for
+                // the CLI's bracketed-paste beacon — or the age ceiling, so an
+                // unexpected TUI can never strand a message forever.
+                let paste_ok = s.paste_ready.load(std::sync::atomic::Ordering::Relaxed)
+                    || s.spawned_at.elapsed() >= Duration::from_secs(30);
+                if new_state == SessionState::Idle && busy_spinner.is_none() && paste_ok {
                     let content = s.pending_text.take().unwrap();
                     s.dialog_since = None;
                     s.dialog_notified = false;
