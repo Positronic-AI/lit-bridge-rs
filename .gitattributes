@@ -1,0 +1,5 @@
+# TUI capture fixtures are byte-exact test inputs frozen by the
+# extract_raw_response characterization suite — a CRLF checkout (Windows
+# runners' autocrlf default) shifts every line and fails the byte-equality
+# assertions. Never normalize them.
+tests/fixtures/* -text
