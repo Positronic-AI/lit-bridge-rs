@@ -1,6 +1,6 @@
 [package]
 name = "lit-bridge-rs"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 description = "Native cross-platform replacement for lit-bridge: drives interactive AI CLI sessions under a real PTY (ConPTY/forkpty), speaks the lit-bridge JSON-lines protocol over a socket. No tmux."
 authors = ["Positronic AI, Inc. <hello@positronic.ai>"]

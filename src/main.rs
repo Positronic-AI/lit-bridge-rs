@@ -167,7 +167,8 @@ impl Monitor {
         let ready = json!({
             "event": "monitor_ready",
             "sessions": self.sessions.len(),
-            "buffered": self.buffer.len()
+            "buffered": self.buffer.len(),
+            "version": env!("CARGO_PKG_VERSION")
         })
         .to_string()
             + "\n";
@@ -1320,6 +1321,27 @@ async fn bind_listeners() -> Result<(Listener, Option<Listener>, Vec<String>)> {
     #[cfg(unix)]
     {
         let socket = arg("--socket", "/tmp/lit-bridge-rs.sock");
+        // REFUSE TO STEAL (2026-08-13, session-leak root cause): unlinking the
+        // socket unconditionally let every new daemon silently disconnect a
+        // LIVE incumbent from the filesystem — the old daemon kept running,
+        // unreachable, holding its sessions and claude children (5 orphaned
+        // daemons observed on one user after a week of restarts). A connect()
+        // succeeding on the control socket means a listener is alive (the
+        // serial accept loop still backlogs while busy) — exit instead.
+        if std::path::Path::new(&socket).exists() {
+            match std::os::unix::net::UnixStream::connect(&socket) {
+                Ok(st) => {
+                    let _ = st.shutdown(std::net::Shutdown::Both);
+                    eprintln!(
+                        "lit-bridge-rs: a live daemon already owns {socket} — refusing to steal it; exiting"
+                    );
+                    std::process::exit(3);
+                }
+                Err(_) => {
+                    // Nobody home behind the file: stale leftover, safe to unlink.
+                }
+            }
+        }
         let _ = std::fs::remove_file(&socket);
         let ctrl = tokio::net::UnixListener::bind(&socket)?;
         eprintln!("lit-bridge-rs listening on {socket}");
@@ -1375,12 +1397,38 @@ async fn main() -> Result<()> {
             }
 
             // Observer task — runs whether or not a client is attached.
+            // Also the idle-exit clock: a daemon with zero sessions and no
+            // attached client for LIT_BRIDGE_RS_IDLE_EXIT_SECS (default 1h)
+            // shuts down cleanly — orphans and squatters evaporate instead of
+            // accumulating across service restarts.
             let m2 = mon.clone();
+            let idle_paths = cleanup_paths.clone();
             tokio::task::spawn_local(async move {
+                let idle_exit = std::time::Duration::from_secs(
+                    std::env::var("LIT_BRIDGE_RS_IDLE_EXIT_SECS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(3600),
+                );
+                let mut last_active = std::time::Instant::now();
                 let mut tick = tokio::time::interval(Duration::from_millis(300));
                 loop {
                     tick.tick().await;
-                    m2.lock().await.poll().await;
+                    let mut m = m2.lock().await;
+                    m.poll().await;
+                    if !m.sessions.is_empty() || m.client.is_some() {
+                        last_active = std::time::Instant::now();
+                    } else if last_active.elapsed() > idle_exit {
+                        drop(m);
+                        eprintln!(
+                            "lit-bridge-rs: no sessions and no client for {}s — idle exit",
+                            idle_exit.as_secs()
+                        );
+                        for p in &idle_paths {
+                            let _ = std::fs::remove_file(p);
+                        }
+                        std::process::exit(0);
+                    }
                 }
             });
 
@@ -1397,9 +1445,16 @@ async fn main() -> Result<()> {
             }
 
             // One client at a time; reconnect-friendly (events buffer while detached).
+            // A client that dies mid-handshake must NOT kill the accept loop
+            // (an `?` here once made any dead connection fatal to the whole
+            // control plane — a zombie daemon with sessions nobody can reach).
             loop {
                 let (rh, wh) = listener.accept_split().await?;
-                mon.lock().await.attach_client(wh).await?;
+                if let Err(e) = mon.lock().await.attach_client(wh).await {
+                    eprintln!("lit-bridge-rs: client handshake failed ({e}); waiting for next client");
+                    mon.lock().await.detach_client();
+                    continue;
+                }
                 let mut lines = BufReader::new(rh).lines();
                 while let Ok(Some(l)) = lines.next_line().await {
                     mon.lock().await.handle_line(&mon, &l).await;
