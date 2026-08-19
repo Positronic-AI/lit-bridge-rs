@@ -407,15 +407,20 @@ impl Monitor {
                 s.begin_turn(); // reset quiescence clocks + position the JSONL watcher
                 match s.send_text(&content) {
                     Ok(()) => {
-                        // On win32 the Enter is written atomically inside send_text.
-                        // Everywhere else (Linux/tmux PTY) send_text writes only the
-                        // text — arm the poll loop to press Enter until the turn
-                        // starts. Without this the message sits unsubmitted in the
-                        // prompt (regression from b3dbb9b).
-                        if !s.win32_active() {
-                            s.pending_submit = Some(Instant::now());
-                            s.last_submit_try = None;
-                        }
+                        // Arm the poll loop to press Enter until the turn starts —
+                        // on EVERY platform. Linux/tmux: send_text writes only the
+                        // text, so the loop does the whole submit (regression from
+                        // b3dbb9b). win32: send_text ends with an atomic in-band
+                        // Enter record, but the CLI's async paste-commit can still
+                        // swallow it — the prompt sits at "[N lines pasted]" until
+                        // a human presses Enter in the terminal view (Katie/TCF,
+                        // 2026-08-19, only ever seen on her slow corporate box).
+                        // The loop is the automated version of that human Enter:
+                        // verified against turn start, spaced, dialog-guarded, and
+                        // send_enter() is win32-aware. A spare Enter after a turn
+                        // already started is a no-op on an empty prompt.
+                        s.pending_submit = Some(Instant::now());
+                        s.last_submit_try = None;
                         let old = s.state;
                         s.state = SessionState::Thinking;
                         Ok(old)
@@ -436,9 +441,9 @@ impl Monitor {
             }
             Err(msg) => self.emit(json!({"session": key, "event": "error", "message": msg})).await,
         }
-        // win32: submission is handled atomically inside send_text (bracketed
-        // paste immediately followed by the Enter record). Non-win32: the poll
-        // loop submits (armed above) since send_text writes text only.
+        // Submission is verified by the poll loop on every platform (armed
+        // above): win32 gets an atomic in-band Enter as the first attempt, the
+        // loop retries until the turn provably starts.
         let _ = sent_ok;
     }
 
