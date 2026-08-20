@@ -785,6 +785,13 @@ impl Monitor {
                         .last_submit_try
                         .map_or(true, |t| t.elapsed() > Duration::from_millis(900))
                 {
+                    // Breadcrumb: surfaces in the sidecar log as "Monitor stderr",
+                    // so a user's Send-Logs shows whether this loop is doing work.
+                    eprintln!(
+                        "lit-bridge-rs: submit retry for {} ({}ms after paste)",
+                        s.name,
+                        pasted_at.elapsed().as_millis()
+                    );
                     let _ = s.send_enter();
                     s.last_submit_try = Some(Instant::now());
                 }
