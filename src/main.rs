@@ -421,6 +421,8 @@ impl Monitor {
                         // already started is a no-op on an empty prompt.
                         s.pending_submit = Some(Instant::now());
                         s.last_submit_try = None;
+                        s.repastes = 0;
+                        s.submit_tries = 0;
                         let old = s.state;
                         s.state = SessionState::Thinking;
                         Ok(old)
@@ -705,6 +707,8 @@ impl Monitor {
                             // first-message path, the one most exposed).
                             s.pending_submit = Some(Instant::now());
                             s.last_submit_try = None;
+                            s.repastes = 0;
+                            s.submit_tries = 0;
                             let old = s.state;
                             s.state = SessionState::Thinking;
                             events.push(json!({"session": s.name.clone(), "event": "dialog_released"}));
@@ -771,8 +775,16 @@ impl Monitor {
             // up: no Enter, no "turn started" inference, and the retry window is
             // re-armed so submission resumes cleanly if the dialog clears.
             if let Some(pasted_at) = s.pending_submit {
-                let turn_started =
-                    self.parser.count_assistant_messages(&cap) > s.baseline_msgs;
+                // "Turn started" has two witnesses: the TUI scrape (an
+                // assistant bullet / non-idle state) and the JSONL transcript,
+                // which gets the user entry the instant a prompt is submitted.
+                // The JSONL is authoritative — on Windows the scrape goes blank
+                // after the welcome screen clears (ConPTY/vt100 artifact, even
+                // on healthy turns), so scrape-only detection kept pressing
+                // Enter for 12s into turns that had long since started.
+                let jsonl_submitted = s.jsonl.as_ref().map_or(false, |j| j.turn_open());
+                let turn_started = jsonl_submitted
+                    || self.parser.count_assistant_messages(&cap) > s.baseline_msgs;
                 let in_dialog = new_state == SessionState::Dialog;
                 if in_dialog {
                     s.pending_submit = Some(Instant::now()); // re-arm; never Enter into a dialog
@@ -787,15 +799,43 @@ impl Monitor {
                         .last_submit_try
                         .map_or(true, |t| t.elapsed() > Duration::from_millis(900))
                 {
-                    // Breadcrumb: surfaces in the sidecar log as "Monitor stderr",
-                    // so a user's Send-Logs shows whether this loop is doing work.
-                    eprintln!(
-                        "lit-bridge-rs: submit retry for {} ({}ms after paste)",
-                        s.name,
-                        pasted_at.elapsed().as_millis()
-                    );
-                    let _ = s.send_enter();
-                    s.last_submit_try = Some(Instant::now());
+                    // Which retry? If the JSONL still shows no submitted turn
+                    // after several Enters, the PASTE itself was swallowed (seen
+                    // on Windows while the CLI re-inits its input layer during
+                    // startup / the "/rc connecting" handshake) — Enter alone can
+                    // never recover that, so paste again, bounded. Otherwise
+                    // press Enter again (the "[N lines pasted]" wedge).
+                    let swallowed = !jsonl_submitted
+                        && s.submit_tries >= 3
+                        && pasted_at.elapsed() > Duration::from_millis(4000)
+                        && s.repastes < 2;
+                    if swallowed {
+                        s.repastes += 1;
+                        eprintln!(
+                            "lit-bridge-rs: paste not submitted {}ms after paste ({} Enters, no JSONL turn) — re-pasting {} (attempt {})",
+                            pasted_at.elapsed().as_millis(),
+                            s.submit_tries,
+                            s.name,
+                            s.repastes
+                        );
+                        let text = s.sent.clone();
+                        let _ = s.send_text(&text);
+                        s.pending_submit = Some(Instant::now());
+                        s.last_submit_try = None;
+                        s.submit_tries = 0;
+                    } else {
+                        // Breadcrumb: surfaces in the sidecar log as "Monitor
+                        // stderr", so a user's Send-Logs shows whether this
+                        // loop is doing work.
+                        eprintln!(
+                            "lit-bridge-rs: submit retry for {} ({}ms after paste)",
+                            s.name,
+                            pasted_at.elapsed().as_millis()
+                        );
+                        let _ = s.send_enter();
+                        s.last_submit_try = Some(Instant::now());
+                        s.submit_tries += 1;
+                    }
                 }
             }
             if s.observing {

@@ -44,6 +44,9 @@ pub struct Session {
     /// and submits it when the prompt returns to idle — the message is never
     /// typed into a dialog and never dropped.
     pub pending_text: Option<String>,
+    /// Re-paste attempts for the current submit (the paste itself was
+    /// swallowed — prompt still empty well after the write). Bounded.
+    pub repastes: u8,
     /// Set once the CLI enables bracketed paste (ESC[?2004h) — the authoritative
     /// "input layer is live" beacon. Sending before this races the TUI's boot:
     /// the paste markers get eaten as literal text and the CLI receives a
@@ -90,6 +93,8 @@ pub struct Session {
     output_tx: broadcast::Sender<Vec<u8>>,
     // Kept alive for the lifetime of the session; dropping closes the PTY.
     _master: Box<dyn MasterPty + Send>,
+    /// Enter presses issued for the current submit (retry loop).
+    pub submit_tries: u8,
     child: Box<dyn Child + Send + Sync>,
 }
 
@@ -253,6 +258,7 @@ impl Session {
             pending_submit: None,
             last_submit_try: None,
             pending_text: None,
+            repastes: 0,
             paste_ready,
             spawned_at: Instant::now(),
             dialog_since: None,
@@ -269,6 +275,7 @@ impl Session {
             screen,
             output_tx,
             _master: pair.master,
+            submit_tries: 0,
             child,
         })
     }

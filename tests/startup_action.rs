@@ -125,3 +125,4 @@ fn responding_session_is_not_a_dialog() {
         StartupAction::Booting
     );
 }
+
