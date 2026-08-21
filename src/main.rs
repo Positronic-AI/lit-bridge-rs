@@ -407,6 +407,7 @@ impl Monitor {
                 s.begin_turn(); // reset quiescence clocks + position the JSONL watcher
                 match s.send_text(&content) {
                     Ok(()) => {
+                        s.mark_sent();
                         // Arm the poll loop to press Enter until the turn starts —
                         // on EVERY platform. Linux/tmux: send_text writes only the
                         // text, so the loop does the whole submit (regression from
@@ -423,6 +424,9 @@ impl Monitor {
                         s.last_submit_try = None;
                         s.repastes = 0;
                         s.submit_tries = 0;
+                        s.echo_probe = None;
+                        s.proven_w32 = None;
+                        s.frozen_since = None;
                         let old = s.state;
                         s.state = SessionState::Thinking;
                         Ok(old)
@@ -701,6 +705,7 @@ impl Monitor {
                     s.begin_turn();
                     match s.send_text(&content) {
                         Ok(()) => {
+                            s.mark_sent();
                             // Every platform — same reasoning as cmd_send
                             // (win32's atomic Enter can still be swallowed by
                             // the async paste-commit; this is the cold-start
@@ -709,6 +714,9 @@ impl Monitor {
                             s.last_submit_try = None;
                             s.repastes = 0;
                             s.submit_tries = 0;
+                            s.echo_probe = None;
+                            s.proven_w32 = None;
+                            s.frozen_since = None;
                             let old = s.state;
                             s.state = SessionState::Thinking;
                             events.push(json!({"session": s.name.clone(), "event": "dialog_released"}));
@@ -799,40 +807,108 @@ impl Monitor {
                         .last_submit_try
                         .map_or(true, |t| t.elapsed() > Duration::from_millis(900))
                 {
-                    // Which retry? If the JSONL still shows no submitted turn
-                    // after several Enters, the PASTE itself was swallowed (seen
-                    // on Windows while the CLI re-inits its input layer during
-                    // startup / the "/rc connecting" handshake) — Enter alone can
-                    // never recover that, so paste again, bounded. Otherwise
-                    // press Enter again (the "[N lines pasted]" wedge).
-                    let swallowed = !jsonl_submitted
+
+                    // Which retry? Enter presses alternate dialects (win32 record /
+                    // raw CR) because the tracked input mode can be stale. If the
+                    // JSONL still shows no submitted turn after three of those,
+                    // the CLI re-initialised its input layer under us (Windows,
+                    // during startup / the "/rc connecting" handshake): the paste
+                    // chip on screen is a GHOST whose content is gone — the
+                    // 2026-08-21 demo-2 transcript shows a raw CR submitting the
+                    // literal "[Pasted text #2 +142 lines]". Recovery: clear the
+                    // prompt, paste again, submit in both dialects. Bounded.
+                    let stalled = !jsonl_submitted
                         && s.submit_tries >= 3
                         && pasted_at.elapsed() > Duration::from_millis(4000)
                         && s.repastes < 2;
-                    if swallowed {
-                        s.repastes += 1;
-                        eprintln!(
-                            "lit-bridge-rs: paste not submitted {}ms after paste ({} Enters, no JSONL turn) — re-pasting {} (attempt {})",
-                            pasted_at.elapsed().as_millis(),
-                            s.submit_tries,
-                            s.name,
-                            s.repastes
-                        );
-                        let text = s.sent.clone();
-                        let _ = s.send_text(&text);
-                        s.pending_submit = Some(Instant::now());
-                        s.last_submit_try = None;
-                        s.submit_tries = 0;
+                    if stalled {
+                        // ECHO PROBE — find out which input dialect the CLI is
+                        // honoring right now, empirically, before re-pasting in
+                        // it. Type one character; a live CLI repaints the prompt
+                        // (child output, not ConPTY — a resize bounce is answered
+                        // by ConPTY itself and proved nothing, 2026-08-21). Raw
+                        // first, then a win32 record; whichever echoes is the
+                        // dialect. Neither → frozen: hold, re-probe, never type
+                        // the message into a CLI that isn't listening.
+                        match s.echo_probe {
+                            None => {
+                                let _ = s.send_char('x', false);
+                                s.mark_sent();
+                                s.echo_probe = Some((false, Instant::now()));
+                            }
+                            Some((w32, at)) if at.elapsed() < Duration::from_millis(700) => {
+                                if s.reacted_since_send() {
+                                    s.proven_w32 = Some(w32);
+                                }
+                            }
+                            Some((w32, _)) => {
+                                if s.reacted_since_send() {
+                                    s.proven_w32 = Some(w32);
+                                } else if !w32 {
+                                    let _ = s.send_char('x', true);
+                                    s.mark_sent();
+                                    s.echo_probe = Some((true, Instant::now()));
+                                } else {
+                                    // Silent in both dialects: frozen. Hold the
+                                    // clocks and try the probe again shortly.
+                                    if s.frozen_since.is_none() {
+                                        s.frozen_since = Some(Instant::now());
+                                        eprintln!(
+                                            "lit-bridge-rs: {} echoes neither dialect — frozen; holding until it does",
+                                            s.name
+                                        );
+                                    }
+                                    if s.frozen_since.map_or(false, |t| t.elapsed() > Duration::from_secs(180)) {
+                                        eprintln!("lit-bridge-rs: {} silent for 180s — giving up this submit", s.name);
+                                        s.pending_submit = None;
+                                        s.frozen_since = None;
+                                        s.echo_probe = None;
+                                    } else {
+                                        s.pending_submit = Some(Instant::now());
+                                        s.echo_probe = None; // re-probe next tick
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(w32) = s.proven_w32.take() {
+                            if let Some(t) = s.frozen_since.take() {
+                                eprintln!(
+                                    "lit-bridge-rs: {} echoing again after {}ms silent",
+                                    s.name,
+                                    t.elapsed().as_millis()
+                                );
+                            }
+                            s.echo_probe = None;
+                            s.repastes += 1;
+                            eprintln!(
+                                "lit-bridge-rs: not submitted {}ms after paste ({} Enters, no JSONL turn) — CLI echoes {} — clearing prompt + re-pasting {} (attempt {})",
+                                pasted_at.elapsed().as_millis(),
+                                s.submit_tries,
+                                if w32 { "win32 records" } else { "raw bytes" },
+                                s.name,
+                                s.repastes
+                            );
+                            let text = s.sent.clone();
+                            let _ = s.clear_prompt(8);
+                            let _ = s.send_text_in(&text, w32);
+                            s.mark_sent();
+                            s.pending_submit = Some(Instant::now());
+                            s.last_submit_try = None;
+                            s.submit_tries = 0;
+                        }
                     } else {
                         // Breadcrumb: surfaces in the sidecar log as "Monitor
                         // stderr", so a user's Send-Logs shows whether this
                         // loop is doing work.
+                        let raw = s.submit_tries % 2 == 1;
                         eprintln!(
-                            "lit-bridge-rs: submit retry for {} ({}ms after paste)",
+                            "lit-bridge-rs: submit retry for {} ({}ms after paste, {})",
                             s.name,
-                            pasted_at.elapsed().as_millis()
+                            pasted_at.elapsed().as_millis(),
+                            if raw { "raw CR" } else { "Enter record" }
                         );
-                        let _ = s.send_enter();
+                        let _ = if raw { s.send_enter_raw() } else { s.send_enter() };
+                        s.mark_sent();
                         s.last_submit_try = Some(Instant::now());
                         s.submit_tries += 1;
                     }

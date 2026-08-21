@@ -88,6 +88,12 @@ pub struct Session {
     /// interactive Claude TUI negotiates this and ignores legacy VT keystrokes, so
     /// we must encode input as win32 input records. Cleared on `ESC[?9001l`.
     win32: Arc<AtomicBool>,
+    /// Total bytes the CLI has written to the PTY. "Did it repaint since I sent
+    /// that keystroke?" is answered from THIS, never from the screen model —
+    /// on Windows the model can sit blank while the CLI is alive and talking.
+    out_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// `out_bytes` at the moment of our last send (paste / Enter / recovery).
+    pub sent_at_bytes: u64,
     screen: Arc<Mutex<vt100::Parser>>,
     /// Live tee of the raw PTY output, for terminal-attach clients (the escape hatch).
     output_tx: broadcast::Sender<Vec<u8>>,
@@ -95,6 +101,13 @@ pub struct Session {
     _master: Box<dyn MasterPty + Send>,
     /// Enter presses issued for the current submit (retry loop).
     pub submit_tries: u8,
+    /// When the CLI stopped reacting to our input (no output since a send).
+    pub frozen_since: Option<Instant>,
+    /// Echo-probe state for the recovery ladder: which dialect we last typed
+    /// the probe character in, and when. `None` = no probe outstanding.
+    pub echo_probe: Option<(bool, Instant)>,
+    /// Dialect proven by echo during this submit (true = win32 records).
+    pub proven_w32: Option<bool>,
     child: Box<dyn Child + Send + Sync>,
 }
 
@@ -112,6 +125,7 @@ fn key_w32(key: &str) -> Option<String> {
     const ENH: u32 = 0x0100;
     let (vk, sc, uc, cs) = match key {
         "Enter" => (0x0D, 0x1C, 0x0D, 0),
+        "Backspace" => (0x08, 0x0E, 0x08, 0),
         "Down" => (0x28, 0x50, 0, ENH),
         "Up" => (0x26, 0x48, 0, ENH),
         "Left" => (0x25, 0x4B, 0, ENH),
@@ -125,6 +139,22 @@ fn key_w32(key: &str) -> Option<String> {
 }
 
 impl Session {
+    /// Bytes the CLI has emitted so far (see `out_bytes`).
+    pub fn output_bytes(&self) -> u64 {
+        self.out_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Stamp "we just sent input" so the next tick can ask whether the CLI
+    /// reacted (emitted anything) since.
+    pub fn mark_sent(&mut self) {
+        self.sent_at_bytes = self.output_bytes();
+    }
+
+    /// True if the CLI has written anything since the last `mark_sent`.
+    pub fn reacted_since_send(&self) -> bool {
+        self.output_bytes() != self.sent_at_bytes
+    }
+
     pub fn win32_active(&self) -> bool {
         self.win32.load(Ordering::Relaxed)
     }
@@ -188,11 +218,13 @@ impl Session {
         let mut reader = pair.master.try_clone_reader()?;
         let win32 = Arc::new(AtomicBool::new(false));
         let paste_ready = Arc::new(AtomicBool::new(false));
+        let out_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         {
             let s = screen.clone();
             let tee = output_tx.clone();
             let win32_r = win32.clone();
             let paste_r = paste_ready.clone();
+            let out_r = out_bytes.clone();
             // Diagnostic: dump raw PTY output to a file when LIT_BRIDGE_RS_RAWLOG is set.
             // Inert in production; used to inspect the CLI's terminal-capability handshake.
             let raw_log = std::env::var("LIT_BRIDGE_RS_RAWLOG").ok();
@@ -207,6 +239,7 @@ impl Session {
                         Ok(0) => break,
                         Ok(n) => {
                             let chunk = &buf[..n];
+                            out_r.fetch_add(n as u64, Ordering::Relaxed);
                             // Track the CLI's win32-input-mode negotiation so input is
                             // encoded correctly (Windows interactive TUI).
                             if chunk.windows(8).any(|w| w == b"\x1b[?9001h") {
@@ -275,7 +308,12 @@ impl Session {
             screen,
             output_tx,
             _master: pair.master,
+            out_bytes,
+            sent_at_bytes: 0,
             submit_tries: 0,
+            frozen_since: None,
+            echo_probe: None,
+            proven_w32: None,
             child,
         })
     }
@@ -312,6 +350,44 @@ impl Session {
 
     /// The rendered visible screen as plain text — the `tmux capture-pane -p`
     /// analogue. Used by the parser/observer (which wants un-styled text).
+    /// Type one character in the given dialect (no Enter). Used by the echo
+    /// probe: a live CLI repaints the prompt with the character — output from
+    /// the CHILD, not ConPTY — so an echo proves both liveness and which input
+    /// dialect the CLI is honoring right now.
+    pub fn send_char(&mut self, ch: char, w32: bool) -> Result<()> {
+        if w32 {
+            self.writer.write_all(format!("\x1b[0;0;{};1;0;1_", ch as u32).as_bytes())?;
+        } else {
+            let mut b = [0u8; 4];
+            self.writer.write_all(ch.encode_utf8(&mut b).as_bytes())?;
+        }
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Paste + Enter in an explicit dialect (see send_text / send_text_w32).
+    pub fn send_text_in(&mut self, text: &str, w32: bool) -> Result<()> {
+        if w32 {
+            self.send_text_w32(text)
+        } else {
+            // Raw bracketed paste regardless of the (unreliable) mode flag.
+            let mut out: Vec<u8> = Vec::new();
+            out.extend_from_slice(b"\x1b[200~");
+            for ch in text.chars() {
+                if ch == '\r' {
+                    continue;
+                }
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+            out.extend_from_slice(b"\x1b[201~");
+            out.push(b'\r');
+            self.writer.write_all(&out)?;
+            self.writer.flush()?;
+            Ok(())
+        }
+    }
+
     pub fn capture(&self) -> String {
         self.screen
             .lock()
@@ -390,7 +466,64 @@ impl Session {
         Ok(())
     }
 
+    /// The paste encoded ENTIRELY as win32-input-mode key records — the
+    /// bracketed-paste markers, every character, and Enter — the way Windows
+    /// Terminal itself delivers a paste when that mode is on. Used by the
+    /// recovery ladder as the OTHER dialect: on 2026-08-21 (CLI 2.1.239) a
+    /// raw bracketed paste vanished without a trace into a CLI that was alive
+    /// and answering a resize probe — the very "ignores raw bytes in
+    /// win32-input-mode" case the comment above assumed paste was exempt from.
+    /// Exactly one dialect lands in either mode, so alternating them can't
+    /// double the message. Key-down records only (the up half is noise).
+    pub fn send_text_w32(&mut self, text: &str) -> Result<()> {
+        fn rec(out: &mut Vec<u8>, uc: u32) {
+            out.extend_from_slice(format!("\x1b[0;0;{uc};1;0;1_").as_bytes());
+        }
+        let mut out: Vec<u8> = Vec::new();
+        for ch in "\x1b[200~".chars() {
+            rec(&mut out, ch as u32);
+        }
+        for ch in text.chars() {
+            if ch == '\r' {
+                continue;
+            }
+            rec(&mut out, ch as u32);
+        }
+        for ch in "\x1b[201~".chars() {
+            rec(&mut out, ch as u32);
+        }
+        out.extend_from_slice(key_w32("Enter").unwrap().as_bytes());
+        self.writer.write_all(&out)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
     /// Submit the current input line.
+    /// Enter as a bare carriage return, whatever mode we THINK the CLI is in.
+    /// The win32-input-mode flag is reconstructed from output chunks and can go
+    /// stale (a `?9001l` split across a ConPTY read, or a CLI input re-init) —
+    /// the 2026-08-21 wedge: chip in the prompt, 11 Enter records ignored, one
+    /// raw CR submitted it. Harmless in true win32 mode (raw bytes are ignored).
+    pub fn send_enter_raw(&mut self) -> Result<()> {
+        self.writer.write_all(b"\r")?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Clear whatever sits in the prompt: `n` Backspaces, each in BOTH dialects
+    /// (a win32 record + DEL) so it lands regardless of the stale-mode problem.
+    /// A paste chip deletes as one unit, so a handful clears any leftovers.
+    pub fn clear_prompt(&mut self, n: usize) -> Result<()> {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            out.extend_from_slice(key_w32("Backspace").unwrap().as_bytes());
+            out.push(0x7f);
+        }
+        self.writer.write_all(&out)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
     pub fn send_enter(&mut self) -> Result<()> {
         if self.win32_active() {
             self.writer.write_all(key_w32("Enter").unwrap().as_bytes())?;
