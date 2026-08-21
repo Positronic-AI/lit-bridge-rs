@@ -66,6 +66,17 @@ pub struct JsonlWatcher {
     /// builds/mounts (static-musl, NFS/NAS) and there disables re-anchoring,
     /// stranding the turn on the dead pinned file (the dormant-channel dark turn).
     existing_at_pin: HashSet<PathBuf>,
+    /// The Claude session id this process was spawned to resume (`--resume <id>`),
+    /// if any. A resumed CLI appends to its EXISTING transcript `<id>.jsonl`.
+    resume_hint: Option<String>,
+    /// The transcript this live CLI process has been writing to, learned from the
+    /// first turn that pinned successfully. A single CLI process appends to ONE
+    /// transcript for its lifetime, so later turns must pin to THIS, not re-guess
+    /// by mtime — the mtime heuristic mispicks an unrelated newer sibling and then
+    /// find_rolled won't re-anchor onto a pre-existing file, so the turn goes dark
+    /// (Ben desktop, 2026-08-21: a 5-tool turn on turn 2+ — RANCHOR_MISS looping,
+    /// response never persisted). Cleared only when the file disappears.
+    pinned_id: Option<String>,
     /// Wall-clock moment `begin_turn` pinned the active transcript. A conversation
     /// transcript whose BIRTH time is after this was created during the turn — i.e.
     /// a mid-turn session roll (a `[resumed]` session spins up a fresh transcript and
@@ -86,6 +97,28 @@ pub struct JsonlWatcher {
 }
 
 impl JsonlWatcher {
+    /// Tell the watcher which transcript the CLI was resumed into, so the next
+    /// `begin_turn` pins to it directly. `None` clears the hint (fresh spawn).
+    pub fn set_resume_hint(&mut self, id: Option<String>) {
+        self.resume_hint = id;
+    }
+
+    /// The resumed transcript's path, if `--resume` was given and the file exists.
+    fn resume_hint_path(&self) -> Option<PathBuf> {
+        self.id_path(self.resume_hint.as_deref())
+    }
+
+    /// The established transcript (learned on an earlier turn), if it still exists.
+    fn established_path(&self) -> Option<PathBuf> {
+        self.id_path(self.pinned_id.as_deref())
+    }
+
+    fn id_path(&self, id: Option<&str>) -> Option<PathBuf> {
+        let id = id?;
+        let p = self.project_dir.join(format!("{id}.jsonl"));
+        p.is_file().then_some(p)
+    }
+
     pub fn new(project_dir: PathBuf) -> Self {
         let mut w = JsonlWatcher {
             project_dir,
@@ -97,6 +130,8 @@ impl JsonlWatcher {
             pending_complete: false,
             pin_time: None,
             existing_at_pin: HashSet::new(),
+            resume_hint: None,
+            pinned_id: None,
             turn_in_tokens: 0,
             turn_out_tokens: 0,
             turn_cache_read_tokens: 0,
@@ -203,7 +238,17 @@ impl JsonlWatcher {
                 // — the one safe re-anchor target. No `created()` call, so no born_err.
                 let is_new = !self.existing_at_pin.contains(&p);
                 let conv = is_conversation_transcript(&p);
-                if is_new && conv {
+                // The established/resumed transcript is pre-existing (never
+                // `is_new`) yet is exactly where this session's turns land — a
+                // safe re-anchor target even though it isn't new.
+                let stem = p.file_stem().and_then(|s| s.to_str());
+                let is_known = stem
+                    .map(|st| {
+                        self.pinned_id.as_deref() == Some(st)
+                            || self.resume_hint.as_deref() == Some(st)
+                    })
+                    .unwrap_or(false);
+                if (is_new || is_known) && conv {
                     // Order by mtime (always readable) to pick the freshest roll target.
                     let key = md.modified().unwrap_or(pin_time);
                     if best.as_ref().map(|(t, _)| key > *t).unwrap_or(true) {
@@ -234,7 +279,21 @@ impl JsonlWatcher {
 
     /// Call when a new send starts — find/reset the active transcript at its current EOF.
     pub fn begin_turn(&mut self) {
-        self.file = self.find_active_jsonl();
+        // Pin priority: an explicit `--resume` target, then the transcript this
+        // process already established (a live CLI appends to ONE file for its
+        // lifetime — sticky beats guessing by mtime, which mispicks a newer
+        // sibling), then the mtime heuristic for the very first turn. A genuine
+        // mid-turn roll to a BRAND-NEW file is still caught by find_rolled below.
+        self.file = self
+            .resume_hint_path()
+            .or_else(|| self.established_path())
+            .or_else(|| self.find_active_jsonl());
+        // Learn/refresh the established transcript for subsequent turns.
+        if let Some(f) = &self.file {
+            if let Some(stem) = f.file_stem().and_then(|s| s.to_str()) {
+                self.pinned_id = Some(stem.to_string());
+            }
+        }
         self.pos = self
             .file
             .as_ref()
@@ -667,6 +726,71 @@ fn _path_marker(_: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_conv(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n").unwrap();
+        p
+    }
+
+    #[test]
+    fn sticky_pin_survives_a_newer_sibling_on_a_later_turn() {
+        // THE Ben-desktop dark-turn: a live multi-turn session. Turn 1 pins the
+        // CLI's transcript; before turn 2 an unrelated sibling is touched and is
+        // newer by mtime. Turn 2 must STILL pin the session's own transcript, or
+        // find_rolled rejects it (pre-existing) and the turn goes dark.
+        let dir = std::env::temp_dir().join(format!("lbrs-sticky-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let session = write_conv(&dir, "dd8baa66-0000-0000-0000-000000000000.jsonl");
+        let mut w = JsonlWatcher::new(dir.clone());
+        w.begin_turn(); // turn 1: only one file → pinned + learned
+        assert_eq!(w.file.as_ref(), Some(&session));
+
+        // A newer, unrelated sibling appears (auto-title / another session).
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let _sibling = write_conv(&dir, "5b603c1c-1111-1111-1111-111111111111.jsonl");
+
+        w.begin_turn(); // turn 2
+        assert_eq!(
+            w.file.as_ref(),
+            Some(&session),
+            "sticky pin must beat the newer sibling on turn 2"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_hint_pins_over_a_newer_stale_sibling() {
+        // The Ben-desktop dark-turn shape: a resumed process whose transcript
+        // is OLDER by mtime than an unrelated sibling in the same project dir.
+        // Without the hint, find_active_jsonl would pin the sibling and the turn
+        // would go dark; with the hint, begin_turn must pin the resumed file.
+        let dir = std::env::temp_dir().join(format!(
+            "lbrs-resume-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Write the resumed transcript FIRST, then the sibling — so the sibling
+        // is newer by mtime (the exact ordering that mispinned the real turn).
+        let resumed = write_conv(&dir, "dd8baa66-1111-2222-3333-444455556666.jsonl");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let _sibling = write_conv(&dir, "5b603c1c-9999-8888-7777-666655554444.jsonl");
+
+        let mut w = JsonlWatcher::new(dir.clone());
+        // Sanity: without the hint, the heuristic pins the NEWER sibling.
+        w.begin_turn();
+        assert_eq!(w.file.as_ref(), Some(&_sibling), "heuristic should pick the newest sibling");
+
+        // With the hint, begin_turn pins the resumed file regardless of mtime.
+        w.set_resume_hint(Some("dd8baa66-1111-2222-3333-444455556666".to_string()));
+        w.begin_turn();
+        assert_eq!(w.file.as_ref(), Some(&resumed), "resume hint must win over mtime");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn project_slug_unix_and_windows() {

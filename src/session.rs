@@ -281,7 +281,19 @@ impl Session {
             .get("CLAUDE_CONFIG_DIR")
             .cloned()
             .or_else(|| std::env::var("CLAUDE_CONFIG_DIR").ok());
-        let jsonl = cwd.map(|wd| JsonlWatcher::new(cc_project_dir(wd, config_dir.as_deref())));
+        // Seed the JSONL watcher with the resume id when the CLI was spawned
+        // with `--resume <id>` — its transcript is `<id>.jsonl` and the watcher
+        // must pin there, not guess (Ben desktop resumed-turn dark, 2026-08-21).
+        let resume_id = args
+            .iter()
+            .position(|a| a == "--resume")
+            .and_then(|i| args.get(i + 1))
+            .cloned();
+        let jsonl = cwd.map(|wd| {
+            let mut w = JsonlWatcher::new(cc_project_dir(wd, config_dir.as_deref()));
+            w.set_resume_hint(resume_id);
+            w
+        });
 
         let writer = pair.master.take_writer()?;
         Ok(Session {
