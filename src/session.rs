@@ -108,6 +108,11 @@ pub struct Session {
     pub echo_probe: Option<(bool, Instant)>,
     /// Dialect proven by echo during this submit (true = win32 records).
     pub proven_w32: Option<bool>,
+    /// Probe characters typed so far this submit (each must be backspaced
+    /// away before anything is submitted — they queue up during a freeze).
+    pub probe_chars: u8,
+    /// Last time a probe round started (re-probe cadence while frozen).
+    pub last_probe_round: Option<Instant>,
     child: Box<dyn Child + Send + Sync>,
 }
 
@@ -314,6 +319,8 @@ impl Session {
             frozen_since: None,
             echo_probe: None,
             proven_w32: None,
+            probe_chars: 0,
+            last_probe_round: None,
             child,
         })
     }
@@ -520,6 +527,32 @@ impl Session {
             out.push(0x7f);
         }
         self.writer.write_all(&out)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Backspace `n` times in ONE dialect (the echo-proven one).
+    pub fn backspace_in(&mut self, n: usize, w32: bool) -> Result<()> {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            if w32 {
+                out.extend_from_slice(key_w32("Backspace").unwrap().as_bytes());
+            } else {
+                out.push(0x7f);
+            }
+        }
+        self.writer.write_all(&out)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Enter in an explicit dialect.
+    pub fn send_enter_in(&mut self, w32: bool) -> Result<()> {
+        if w32 {
+            self.writer.write_all(key_w32("Enter").unwrap().as_bytes())?;
+        } else {
+            self.writer.write_all(b"\r")?;
+        }
         self.writer.flush()?;
         Ok(())
     }
