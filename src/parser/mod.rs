@@ -89,6 +89,15 @@ pub struct DialogQuestion {
     pub options: Vec<DialogOption>,
 }
 
+/// What the startup-dialog loop should do next, read off the current frame.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StartupAction {
+    Prompt,
+    Answer { keys: Vec<String>, dialog: String },
+    Unknown,
+    Booting,
+}
+
 /// The contract every CLI TUI parser implements. A parser turns a captured,
 /// VT-rendered screen (the `tmux capture-pane` analogue) into structured state.
 ///
@@ -224,8 +233,17 @@ pub trait TuiParser {
     /// True when the in-flight turn has produced a completion marker after the prompt.
     fn turn_complete(&self, capture: &str) -> bool;
 
-    /// If a startup dialog is present, return (detect-substring, dismiss-keys, name).
-    fn is_startup_dialog(&self, capture: &str) -> Option<(String, Vec<String>, String)>;
+    /// Startup-dialog handling, decided from the screen rather than from a
+    /// substring: returns what to do about the widget that currently owns input.
+    ///
+    /// - `Prompt`: the prompt box is the active widget — never type anything,
+    ///   whatever dialog text may linger above it.
+    /// - `Answer { keys, dialog }`: a recognized startup dialog is the active
+    ///   widget; `keys` is the next keystroke toward dismissing it (one step —
+    ///   the caller re-reads the screen and asks again).
+    /// - `Unknown`: something modal we can't parse — never keystroke into it.
+    /// - `Booting`: neither a prompt nor a dialog yet (splash, blank, spinner).
+    fn startup_action(&self, capture: &str) -> StartupAction;
 
     /// If the screen shows a modal question with an enumerable option list
     /// (a `❯ N. …` picker — CLI system dialogs and AskUserQuestion alike),

@@ -55,7 +55,7 @@ impl Listener {
     }
 }
 
-use lit_bridge_rs::parser::{select_parser, SessionState, TuiParser};
+use lit_bridge_rs::parser::{select_parser, SessionState, StartupAction, TuiParser};
 use lit_bridge_rs::session::Session;
 
 const ROWS: u16 = 50;
@@ -699,10 +699,12 @@ impl Monitor {
                     s.begin_turn();
                     match s.send_text(&content) {
                         Ok(()) => {
-                            if !s.win32_active() {
-                                s.pending_submit = Some(Instant::now());
-                                s.last_submit_try = None;
-                            }
+                            // Every platform — same reasoning as cmd_send
+                            // (win32's atomic Enter can still be swallowed by
+                            // the async paste-commit; this is the cold-start
+                            // first-message path, the one most exposed).
+                            s.pending_submit = Some(Instant::now());
+                            s.last_submit_try = None;
                             let old = s.state;
                             s.state = SessionState::Thinking;
                             events.push(json!({"session": s.name.clone(), "event": "dialog_released"}));
@@ -1067,9 +1069,18 @@ async fn finalize_create(
             m.sessions.get_mut(&key).map(|s| !s.is_alive()).unwrap_or(true)
         };
         if dead {
-            {
-                mon.lock().await.sessions.remove(&key);
-            }
+            // Carry the in-flight message over. A send that raced the dying
+            // --resume process is gone with it (the paste beacon had fired, so
+            // the text went straight in); re-queue it so the fresh CLI gets it
+            // through the startup hold instead of it silently vanishing while
+            // the mux sits "observing" (#general, 2026-08-20: message lost, a
+            // stray dialog keystroke answered instead).
+            let carry = {
+                let mut m = mon.lock().await;
+                m.sessions.remove(&key).and_then(|s| {
+                    s.pending_text.or_else(|| if s.observing && !s.sent.is_empty() { Some(s.sent) } else { None })
+                })
+            };
             {
                 let mut m = mon.lock().await;
                 if let Err(e) = m.spawn_into(&key, &exe, &base_args, cwd.as_deref(), &env, model.clone())
@@ -1078,21 +1089,29 @@ async fn finalize_create(
                         .await;
                     return;
                 }
+                if let Some(text) = carry {
+                    if let Some(s) = m.sessions.get_mut(&key) {
+                        s.pending_text = Some(text);
+                    }
+                    m.emit(json!({"session": key, "event": "startup_hold", "carried": true})).await;
+                }
             }
             resumed = false;
             tokio::time::sleep(Duration::from_millis(1500)).await;
         }
     }
 
-    // Auto-dismiss startup dialogs so the session reaches an interactive prompt.
-    //
-    // Dialogs (workspace-trust, bypass-permissions, theme) can render SECONDS after
-    // spawn — especially under ConPTY on Windows, where claude boots slowly. The old
-    // loop bailed on the first dialog-free frame, so on a slow boot it gave up before
-    // the trust dialog ever appeared and the session wedged on it. Instead, keep
-    // watching until the prompt is genuinely interactive (idle) or we hit a ceiling,
-    // dismissing any dialog we encounter along the way.
+    // Startup dialogs: decided from the screen, one step at a time. The parser
+    // reports who owns input (prompt box vs. modal) and, for a recognized
+    // modal, the single next keystroke toward dismissing it. After each
+    // keystroke we wait for the FRAME to change before reading again — so a
+    // dialog whose text lingers on screen after dismissal (ConPTY repaint lag)
+    // can't be answered twice, and a digit can never land in a live prompt
+    // (the 2026-08-20 "your message came through as 2"). Dialogs can render
+    // SECONDS after spawn under ConPTY, so a Booting frame keeps us waiting;
+    // the ceiling is only the unrecognized-modal backstop below.
     let dialog_deadline = Instant::now() + Duration::from_secs(20);
+    let mut last_cap: Option<String> = None;
     loop {
         if Instant::now() > dialog_deadline {
             break;
@@ -1101,33 +1120,41 @@ async fn finalize_create(
             Some(c) => c,
             None => break,
         };
-        // Bind to a local so the lock guard from the scrutinee is released here —
-        // an `if let mon.lock()...` would hold it across the block and deadlock the
-        // re-lock below (the async Mutex is not reentrant).
-        let dialog = mon.lock().await.parser.is_startup_dialog(&cap);
-        if let Some((_, keys, name)) = dialog {
-            {
-                let mut m = mon.lock().await;
-                if let Some(s) = m.sessions.get_mut(&key) {
-                    for k in &keys {
-                        let _ = s.send_key(k);
-                    }
-                }
-            }
-            mon.lock()
-                .await
-                .emit(json!({"session": key, "event": "dialog_dismissed", "dialog": name}))
-                .await;
-            tokio::time::sleep(Duration::from_millis(1000)).await;
+        // Same frame as the one we just acted on: the CLI hasn't repainted yet.
+        // Don't re-decide on a stale picture.
+        if last_cap.as_deref() == Some(cap.as_str()) {
+            tokio::time::sleep(Duration::from_millis(150)).await;
             continue;
         }
-        // No dialog visible. If the prompt is interactive we're done; otherwise the
-        // CLI may still be booting (or a dialog is about to appear) — wait and re-check.
-        let state = mon.lock().await.parser.detect_state(&cap);
-        if state == SessionState::Idle {
-            break;
+        // Bind to a local so the lock guard from the scrutinee is released here —
+        // holding it across the block would deadlock the re-lock below (the async
+        // Mutex is not reentrant).
+        let action = mon.lock().await.parser.startup_action(&cap);
+        match action {
+            StartupAction::Prompt => break,
+            StartupAction::Answer { keys, dialog } => {
+                {
+                    let mut m = mon.lock().await;
+                    if let Some(s) = m.sessions.get_mut(&key) {
+                        for k in &keys {
+                            let _ = s.send_key(k);
+                        }
+                    }
+                }
+                mon.lock()
+                    .await
+                    .emit(json!({"session": key, "event": "dialog_dismissed", "dialog": dialog, "keys": keys}))
+                    .await;
+                last_cap = Some(cap);
+                // Give the TUI a moment to repaint before the next read.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            StartupAction::Unknown => break, // telemetry below; never keystroke blind
+            StartupAction::Booting => {
+                last_cap = None;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
     // Telemetry: giving up with a modal still on screen means an UNRECOGNIZED

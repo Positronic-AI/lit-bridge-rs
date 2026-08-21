@@ -11,21 +11,32 @@
 use regex::Regex;
 
 use crate::parser::{
-    DialogOption, DialogQuestion, SessionState, TuiContentBlock, TuiMessage, TuiParser, TuiState,
+    DialogOption, DialogQuestion, StartupAction, SessionState, TuiContentBlock, TuiMessage, TuiParser, TuiState,
 };
 
 /// Startup dialogs: (detect-substring, dismiss-keys, name)
-const STARTUP_DIALOGS: &[(&str, &[&str], &str)] = &[
-    ("Select login method", &["Enter"], "login-method"),
-    // Quick-select "2. Yes, I accept". The arrow-key win32 record (ENHANCED_KEY)
-    // does NOT dismiss this dialog under a headless ConPTY; the digit (sent as a
-    // win32 text record) does. See send_key's single-char fallback.
-    ("Yes, I accept", &["2"], "bypass-permissions"),
-    ("Choose the text style", &["Enter"], "theme-selection"),
-    ("enable auto mode", &["Enter"], "auto-mode"),
-    ("Do you trust", &["Enter"], "workspace-trust"),
-    ("I trust this folder", &["Enter"], "workspace-trust"),
-    ("safety check", &["Enter"], "workspace-trust"),
+/// Startup dialogs we know how to answer, as (dialog name, the option label we
+/// want). The screen decides whether a dialog is the active widget and what its
+/// options currently are; this table only says which option to pick. Matching
+/// is case-insensitive substring on the option label, so reorderings and
+/// renumberings in a CLI update still resolve to the right choice.
+const STARTUP_CHOICES: &[(&str, &str)] = &[
+    ("bypass-permissions", "yes, i accept"),
+    ("workspace-trust", "yes, proceed"),
+    ("workspace-trust", "i trust this folder"),
+    ("auto-mode", "yes"),
+];
+
+/// Non-picker startup modals (no numbered options): dismissed with Enter, but
+/// ONLY when the bottom of the screen is a dialog (prompt box absent) and the
+/// anchor text is inside that bottom region — never anywhere else on screen.
+const STARTUP_ENTER_MODALS: &[(&str, &str)] = &[
+    ("Select login method", "login-method"),
+    ("Choose the text style", "theme-selection"),
+    ("Do you trust", "workspace-trust"),
+    ("I trust this folder", "workspace-trust"),
+    ("safety check", "workspace-trust"),
+    ("enable auto mode", "auto-mode"),
 ];
 
 const DIALOG_STRINGS: &[&str] = &["Enter to confirm", "Esc to cancel"];
@@ -140,6 +151,15 @@ impl ClaudeV21Parser {
                 .any(|l| self.is_completion(l.trim()) || self.re_user.is_match(l));
         }
         false
+    }
+}
+
+impl ClaudeV21Parser {
+    /// The bottom 10 non-empty-trimmed lines — the region detect_state uses to
+    /// decide Dialog, so startup anchors are judged against the same slice.
+    fn bottom_region(capture: &str) -> String {
+        let all: Vec<&str> = capture.trim().split('\n').collect();
+        all[all.len().saturating_sub(10)..].join("\n")
     }
 }
 
@@ -695,17 +715,63 @@ impl TuiParser for ClaudeV21Parser {
         false
     }
 
-    fn is_startup_dialog(&self, capture: &str) -> Option<(String, Vec<String>, String)> {
-        for (detect, keys, name) in STARTUP_DIALOGS {
-            if capture.contains(detect) {
-                return Some((
-                    detect.to_string(),
-                    keys.iter().map(|k| k.to_string()).collect(),
-                    name.to_string(),
-                ));
+    fn startup_action(&self, capture: &str) -> StartupAction {
+        // 1. Who owns input right now? A modal REPLACES the prompt box in
+        //    Claude Code, so a visible prompt means no dialog is active —
+        //    regardless of any dialog text lingering higher on the screen
+        //    (ConPTY repaint lag / retained buffer is exactly how a blind
+        //    substring match typed "2" into a live prompt, 2026-08-20).
+        // The prompt box is the LAST widget on screen → it owns input, even if
+        // detect_state's bottom-10 window still sees a dismissed dialog's
+        // footer above it (that window is tuned for the dispatch gate, where
+        // erring toward "dialog" is the safe direction; here it is not).
+        if let Some(last) = capture.lines().rev().map(str::trim_end).find(|l| !l.trim().is_empty()) {
+            let t = last.trim_start();
+            if t.starts_with('❯') && !self.re_dialog_option.is_match(t) {
+                return StartupAction::Prompt;
             }
         }
-        None
+        match self.detect_state(capture) {
+            SessionState::Idle => return StartupAction::Prompt,
+            SessionState::Dialog => {}
+            SessionState::Dead => return StartupAction::Booting,
+            // Thinking/Responding at startup = a resumed session finishing a
+            // turn, or a spinner. Nothing to answer.
+            _ => return StartupAction::Booting,
+        }
+
+        // 2. A numbered picker: find the option we want by its label and take
+        //    ONE step toward it. Already highlighted → Enter confirms. Otherwise
+        //    its digit (quick-select; on pickers that only move the cursor, the
+        //    next read sees it selected and sends Enter).
+        if let Some(q) = self.parse_dialog_question(capture) {
+            for (name, want) in STARTUP_CHOICES {
+                if let Some(opt) = q.options.iter().find(|o| o.label.to_lowercase().contains(want)) {
+                    let keys = if opt.selected { vec!["Enter".to_string()] } else { vec![opt.digit.clone()] };
+                    return StartupAction::Answer { keys, dialog: name.to_string() };
+                }
+            }
+            // Theme / login pickers: whatever is highlighted is the default we
+            // want; confirm it. Recognized by their anchor text in the dialog.
+            let bottom = Self::bottom_region(capture);
+            for (anchor, name) in STARTUP_ENTER_MODALS {
+                if bottom.contains(anchor) {
+                    return StartupAction::Answer { keys: vec!["Enter".to_string()], dialog: name.to_string() };
+                }
+            }
+            return StartupAction::Unknown;
+        }
+
+        // 3. A modal without a numbered list (trust confirmation, "Enter to
+        //    confirm" style). Anchor must be in the bottom region that
+        //    detect_state just classified as the dialog.
+        let bottom = Self::bottom_region(capture);
+        for (anchor, name) in STARTUP_ENTER_MODALS {
+            if bottom.contains(anchor) {
+                return StartupAction::Answer { keys: vec!["Enter".to_string()], dialog: name.to_string() };
+            }
+        }
+        StartupAction::Unknown
     }
 
     fn parse_dialog_question(&self, capture: &str) -> Option<DialogQuestion> {
