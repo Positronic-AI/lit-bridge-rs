@@ -435,6 +435,15 @@ impl JsonlWatcher {
                         rolled.display()
                     ),
                 );
+                // The CLI now writes THIS file for the rest of its life (a resume
+                // forks into a fresh transcript; the `--resume` target is dead).
+                // Learn it and drop the stale hint, or every later begin_turn
+                // re-pins the dead file at EOF and the turn goes dark — 0 chunks,
+                // 300s mux timeout, reply lost (Sans, jupiter 2026-08-25).
+                if let Some(stem) = rolled.file_stem().and_then(|s| s.to_str()) {
+                    self.pinned_id = Some(stem.to_string());
+                }
+                self.resume_hint = None;
                 self.file = Some(rolled);
                 self.pos = 0;
                 // Fall through: read the rolled file from the start this same poll.
@@ -789,6 +798,31 @@ mod tests {
         w.begin_turn();
         assert_eq!(w.file.as_ref(), Some(&resumed), "resume hint must win over mtime");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn roll_target_becomes_the_pin_and_retires_the_resume_hint() {
+        // Sans/jupiter 2026-08-25: `--resume <old>` → Claude forks into a NEW
+        // transcript on the first turn (caught by roll detection), but every later
+        // begin_turn re-pinned <old> at EOF via the resume hint and went dark.
+        let dir = std::env::temp_dir().join(format!("lbrs-roll-pin-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = write_conv(&dir, "a747a403-0000-0000-0000-000000000000.jsonl");
+        let mut w = JsonlWatcher::new(dir.clone());
+        w.set_resume_hint(Some("a747a403-0000-0000-0000-000000000000".to_string()));
+        w.begin_turn();
+        assert_eq!(w.file.as_ref(), Some(&old));
+        // Mid-turn: the CLI forks into a brand-new transcript.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let fresh = write_conv(&dir, "c09a79d5-0000-0000-0000-000000000000.jsonl");
+        let _ = w.poll(); // roll detection re-anchors onto `fresh`
+        assert_eq!(w.file.as_ref(), Some(&fresh), "poll must re-anchor onto the rolled file");
+        // Next turn must stay on the rolled file, not the dead resume target.
+        w.begin_turn();
+        assert_eq!(w.file.as_ref(), Some(&fresh), "begin_turn must pin the rolled transcript");
+        assert!(w.resume_hint.is_none(), "resume hint retired after the roll");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
