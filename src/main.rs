@@ -607,6 +607,31 @@ impl Monitor {
         let reflow_channel = std::env::var("LIT_BRIDGE_RS_REFLOW")
             .ok()
             .filter(|s| !s.is_empty());
+        // Reap sessions whose CLI died underneath us (SIGKILL from outside, OOM,
+        // crash). Without this the child lingers as a zombie, the session keeps
+        // its last screen state (e.g. `dialog`), cmd_create happily reuses the
+        // corpse, and every message sent to it vanishes with no event at all —
+        // #games 2026-09-01. Emit `killed` so the mux tears its side down exactly
+        // as for a commanded kill. Fresh spawns get a grace period: the --resume
+        // retry path (spawn_and_dismiss) owns the first seconds of a session's
+        // life and carries the in-flight message over itself.
+        let dead: Vec<String> = self
+            .sessions
+            .iter_mut()
+            .filter_map(|(k, s)| {
+                if s.spawned_at.elapsed() >= Duration::from_secs(5) && !s.is_alive() {
+                    Some(k.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for k in dead {
+            if let Some(mut s) = self.sessions.remove(&k) {
+                s.kill(); // wait() — reaps the zombie
+                self.emit(json!({"session": k, "event": "killed", "reason": "exited"})).await;
+            }
+        }
         for s in self.sessions.values_mut() {
             // Session key is `lit-<user>-<agent>:<channel_id>`; the `:` anchor stops a
             // channel id from matching another that merely ends with the same text.
