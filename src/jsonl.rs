@@ -364,6 +364,34 @@ impl JsonlWatcher {
         self.reset_turn_usage();
     }
 
+    /// Close the accumulated turn: build its `turn_complete` (clean text + usage),
+    /// mark the watcher closed and drop the parts. Shared by the end-of-poll gate
+    /// and the user-boundary flush so both close a turn identically.
+    fn take_turn_complete(&mut self) -> Value {
+        let content = self.turn_text_parts.join("\n\n");
+        crate::diag::log(
+            "TURN",
+            &format!(
+                "complete parts={} len={}",
+                self.turn_text_parts.len(),
+                content.chars().count()
+            ),
+        );
+        self.open = false;
+        self.pending_complete = false;
+        let mut ev = json!({"event": "turn_complete", "content": content});
+        if self.turn_usage_seen {
+            ev["usage"] = json!({
+                "input_tokens": self.turn_in_tokens,
+                "output_tokens": self.turn_out_tokens,
+                "cache_read_tokens": self.turn_cache_read_tokens,
+                "cache_creation_tokens": self.turn_cache_creation_tokens,
+            });
+        }
+        self.turn_text_parts.clear();
+        ev
+    }
+
     pub fn get_session_id(&self) -> Option<String> {
         let f = self.file.clone().or_else(|| self.find_active_jsonl())?;
         f.file_stem().map(|s| s.to_string_lossy().to_string())
@@ -577,6 +605,25 @@ impl JsonlWatcher {
                             .any(|b| b.get("type").and_then(|v| v.as_str()) == Some("text")),
                         _ => false,
                     };
+                    // BACK-TO-BACK TURNS IN ONE BATCH: queued input (a /loop fire, a
+                    // typed line, an injected follow-up) starts the next CLI turn the
+                    // instant the prior reply lands, so one poll can carry `end_turn` +
+                    // reply text + the NEW user line. The reset below used to wipe that
+                    // reply before the end-of-poll gate ran ("defer: end_turn with empty
+                    // parts") and the batch completed with only the follow-on turn's text
+                    // — the real reply was gone (2026-09-02, a loop tick replaced it).
+                    // Close the prior turn FIRST, then start the new one.
+                    if is_user_turn
+                        && (completed || self.pending_complete)
+                        && !self.turn_text_parts.is_empty()
+                    {
+                        crate::diag::log(
+                            "TURN",
+                            "flush: user boundary landed behind a terminal stop — closing the prior turn first",
+                        );
+                        events.push(self.take_turn_complete());
+                        completed = false;
+                    }
                     if is_user_turn {
                         self.turn_text_parts.clear();
                         self.emitted_tool_ids.clear();
@@ -624,28 +671,7 @@ impl JsonlWatcher {
         // turn OPEN and wait for the next poll to bring the text.
         let want_complete = completed || self.pending_complete;
         if want_complete && !self.turn_text_parts.is_empty() {
-            let content = self.turn_text_parts.join("\n\n");
-            crate::diag::log(
-                "TURN",
-                &format!(
-                    "complete parts={} len={}",
-                    self.turn_text_parts.len(),
-                    content.chars().count()
-                ),
-            );
-            self.open = false;
-            self.pending_complete = false;
-            let mut ev = json!({"event": "turn_complete", "content": content});
-            if self.turn_usage_seen {
-                ev["usage"] = json!({
-                    "input_tokens": self.turn_in_tokens,
-                    "output_tokens": self.turn_out_tokens,
-                    "cache_read_tokens": self.turn_cache_read_tokens,
-                    "cache_creation_tokens": self.turn_cache_creation_tokens,
-                });
-            }
-            events.push(ev);
-            self.turn_text_parts.clear();
+            events.push(self.take_turn_complete());
         } else if want_complete {
             // Terminal stop seen but nothing to emit yet — defer. Keep the turn open
             // so neither the TUI fallback nor a stale state can close it before the
@@ -823,6 +849,66 @@ mod tests {
         w.begin_turn();
         assert_eq!(w.file.as_ref(), Some(&fresh), "begin_turn must pin the rolled transcript");
         assert!(w.resume_hint.is_none(), "resume hint retired after the roll");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn append(p: &std::path::Path, line: &str) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(p).unwrap();
+        writeln!(f, "{line}").unwrap();
+    }
+    fn assistant(text: &str) -> String {
+        let blocks = if text.is_empty() { "[]".to_string() } else { format!("[{{\"type\":\"text\",\"text\":\"{text}\"}}]") };
+        format!("{{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":{blocks},\"stop_reason\":\"end_turn\"}}}}")
+    }
+    fn completes(evs: &[Value]) -> Vec<String> {
+        evs.iter()
+            .filter(|e| e.get("event").and_then(|v| v.as_str()) == Some("turn_complete"))
+            .map(|e| e.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn user_boundary_behind_end_turn_flushes_the_prior_reply() {
+        // 2026-09-02: a /loop fire was queued behind a channel reply. One poll carried
+        // the reply's `end_turn` + text + the NEW user line; the boundary reset wiped
+        // the reply and the turn later completed with the loop tick's text instead.
+        let dir = std::env::temp_dir().join(format!("lbrs-flush-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = write_conv(&dir, "aaaaaaaa-0000-0000-0000-000000000000.jsonl");
+        let mut w = JsonlWatcher::new(dir.clone());
+        w.begin_turn();
+
+        append(&t, &assistant(""));          // thinking-straddle: empty end_turn first
+        append(&t, &assistant("Reply A"));
+        append(&t, "{\"type\":\"queue-operation\"}");
+        append(&t, "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"/help\"}}");
+        let evs = w.poll();
+        assert_eq!(completes(&evs), vec!["Reply A"], "prior reply must close at the boundary");
+        assert!(w.turn_open(), "the follow-on turn is open after the user line");
+
+        append(&t, &assistant("Reply B"));
+        let evs = w.poll();
+        assert_eq!(completes(&evs), vec!["Reply B"], "follow-on turn completes on its own");
+        assert!(!w.turn_open());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_whole_turns_in_one_batch_complete_in_order() {
+        let dir = std::env::temp_dir().join(format!("lbrs-flush2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = write_conv(&dir, "bbbbbbbb-0000-0000-0000-000000000000.jsonl");
+        let mut w = JsonlWatcher::new(dir.clone());
+        w.begin_turn();
+        append(&t, &assistant("Reply A"));
+        append(&t, "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"/help\"}}");
+        append(&t, &assistant("Reply B"));
+        let evs = w.poll();
+        assert_eq!(completes(&evs), vec!["Reply A", "Reply B"]);
+        assert!(!w.turn_open());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

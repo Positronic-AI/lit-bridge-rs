@@ -956,8 +956,35 @@ impl Monitor {
             if s.observing {
                 // AUTHORITATIVE completion path: the JSONL transcript. `turn_complete`
                 // carries clean text; tool_use/tool_result/replace stream through.
+                let mut closed = false;
                 for ev in s.poll_jsonl() {
                     match ev.get("event").and_then(|v| v.as_str()) {
+                        Some("turn_complete") if closed => {
+                            // FOLLOW-ON TURN in the same batch: queued input (a /loop
+                            // fire, a typed line) started a new CLI turn right behind the
+                            // observed one and the watcher closed both. The observed turn
+                            // is already complete above, so this one is out-of-band —
+                            // relay it the organic way, tagged, so the API persists it as
+                            // its own message instead of it vanishing (2026-09-02).
+                            let content = ev.get("content").cloned().unwrap_or_else(|| json!(""));
+                            let nonempty =
+                                content.as_str().map(|c| !c.trim().is_empty()).unwrap_or(false);
+                            let cid = s.name.rsplit_once(':').map(|(_, c)| c.to_string());
+                            if let (true, Some(cid)) = (nonempty, cid) {
+                                let mut complete = json!({
+                                    "session": s.name.clone(),
+                                    "event": "complete",
+                                    "organic": true,
+                                    "followup": true,
+                                    "content": content,
+                                    "channel_id": cid,
+                                });
+                                if let Some(usage) = ev.get("usage") {
+                                    complete["usage"] = usage.clone();
+                                }
+                                events.push(complete);
+                            }
+                        }
                         Some("turn_complete") => {
                             let content = ev.get("content").cloned().unwrap_or_else(|| json!(""));
                             let mut complete = json!({
@@ -970,10 +997,13 @@ impl Monitor {
                             }
                             events.push(complete);
                             s.observing = false;
+                            closed = true;
                             // Re-anchor the watcher to the tail so the organic path
                             // (below, next poll) can't re-read this finished turn.
                             s.prime_jsonl_to_eof();
                         }
+                        // v1 organic semantics: no mid-turn frames for a follow-on turn.
+                        _ if closed => {}
                         _ => {
                             let mut e = ev;
                             e["session"] = json!(s.name.clone());
