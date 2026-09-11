@@ -549,6 +549,27 @@ impl JsonlWatcher {
                                         parts_grew = true;
                                     }
                                 }
+                                // Narration: Fable writes a one-line summary of each
+                                // step as a `thinking` block before the tool call (the
+                                // CLI's "· summarized" bullets). The real thinking is
+                                // stored empty; the summary is the only step-by-step
+                                // account of a tool-heavy turn, and without it the
+                                // chat shows one opener, an "N actions" chip and dots
+                                // (Ben, 2026-09-11). Relayed in the marker both clients
+                                // already parse for reasoning from other backends.
+                                Some("thinking") => {
+                                    let text = block
+                                        .get("thinking")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .trim()
+                                        .to_string();
+                                    if !text.is_empty() {
+                                        self.turn_text_parts
+                                            .push(format!("[THINKING]{text}[/THINKING]"));
+                                        parts_grew = true;
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -892,6 +913,30 @@ mod tests {
         let evs = w.poll();
         assert_eq!(completes(&evs), vec!["Reply B"], "follow-on turn completes on its own");
         assert!(!w.turn_open());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn narration_thinking_blocks_are_relayed_and_empty_ones_dropped() {
+        let dir = std::env::temp_dir().join(format!("lbrs-narr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = write_conv(&dir, "cccccccc-0000-0000-0000-000000000000.jsonl");
+        let mut w = JsonlWatcher::new(dir.clone());
+        w.begin_turn();
+        // Real thinking is stored empty; the narration summary follows it.
+        append(&t, "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"x\"}],\"stop_reason\":\"tool_use\"}}");
+        append(&t, "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"Checking the logs first.\\n\\n\",\"signature\":\"y\"}],\"stop_reason\":\"tool_use\"}}");
+        let evs = w.poll();
+        let replaced: Vec<&str> = evs
+            .iter()
+            .filter(|e| e.get("event").and_then(|v| v.as_str()) == Some("replace"))
+            .map(|e| e.get("text").and_then(|v| v.as_str()).unwrap_or(""))
+            .collect();
+        assert_eq!(replaced, vec!["[THINKING]Checking the logs first.[/THINKING]"]);
+        append(&t, &assistant("Done."));
+        let evs = w.poll();
+        assert_eq!(completes(&evs), vec!["[THINKING]Checking the logs first.[/THINKING]\n\nDone."]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

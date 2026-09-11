@@ -839,25 +839,33 @@ impl TuiParser for ClaudeV21Parser {
 
         // Question text: the non-empty lines directly above the options, stopping
         // at anything that reads as conversation/chrome rather than dialog prose.
+        let is_rule = |t: &str| {
+            self.re_separator.is_match(t)
+                || t.chars().all(|c| {
+                    matches!(c, '─' | '╭' | '╮' | '╰' | '╯' | '├' | '┤' | '┬' | '┴' | '-' | '=')
+                })
+        };
+        let is_chrome = |t: &str| {
+            t.starts_with('●')
+                || t.starts_with('⎿')
+                || t.starts_with('✻')
+                || is_rule(t)
+                || self.re_status.is_match(t)
+        };
         let mut text_lines: Vec<&str> = Vec::new();
-        for line in cleaned[..start].iter().rev() {
+        // The blank line that ended the question text, when that is how it
+        // ended — the context walk below resumes above it.
+        let mut blank_above: Option<usize> = None;
+        for (i, line) in cleaned[..start].iter().enumerate().rev() {
             let t = line.trim();
             if t.is_empty() {
                 if text_lines.is_empty() {
                     continue;
                 }
+                blank_above = Some(i);
                 break;
             }
-            let border_only = t
-                .chars()
-                .all(|c| matches!(c, '─' | '╭' | '╮' | '╰' | '╯' | '├' | '┤' | '┬' | '┴' | '-' | '='));
-            if t.starts_with('●')
-                || t.starts_with('⎿')
-                || t.starts_with('✻')
-                || border_only
-                || self.re_separator.is_match(t)
-                || self.re_status.is_match(t)
-            {
+            if is_chrome(t) {
                 break;
             }
             text_lines.push(t);
@@ -866,8 +874,54 @@ impl TuiParser for ClaudeV21Parser {
             }
         }
         text_lines.reverse();
+
+        // Context: the dialog body above the question. For a permission prompt
+        // that is the tool name, the command itself and the guard's reason
+        // ("Dangerous rm operation on possibly-empty variable path") — which the
+        // one-line question ("Do you want to proceed?") hides from whoever
+        // answers the relayed card (Ben approved 16 of them blind, games,
+        // 2026-09-11). Kept only when the walk reaches the dialog's own top
+        // rule/border: hitting conversation chrome or a prompt echo first means
+        // those lines were transcript, not dialog, and nothing is kept.
+        let mut context_lines: Vec<&str> = Vec::new();
+        let mut anchored = false;
+        if let Some(b) = blank_above {
+            for line in cleaned[..b].iter().rev() {
+                let t = line.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                if is_rule(t) {
+                    anchored = true;
+                    break;
+                }
+                // AskUserQuestion draws its header as a tab chip ("☐ Next pass")
+                // between the top rule and the question. That is the card's own
+                // title, already carried by the tool call, not dialog body — and
+                // keeping it broke the bridge-card/tool-card dedupe (2026-09-11).
+                if t.starts_with('☐') || t.starts_with('☑') || t.starts_with('☒') {
+                    continue;
+                }
+                if is_chrome(t) || self.re_user.is_match(t) || context_lines.len() >= 14 {
+                    break;
+                }
+                context_lines.push(t);
+            }
+        }
+        let context = if anchored {
+            context_lines.reverse();
+            let s = context_lines.join("\n");
+            if s.chars().count() > 1200 {
+                format!("{}…", s.chars().take(1200).collect::<String>())
+            } else {
+                s
+            }
+        } else {
+            String::new()
+        };
         Some(DialogQuestion {
             text: text_lines.join("\n"),
+            context,
             options,
         })
     }

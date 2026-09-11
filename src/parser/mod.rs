@@ -86,6 +86,9 @@ pub struct DialogOption {
 pub struct DialogQuestion {
     /// The prompt text above the option list.
     pub text: String,
+    /// The dialog body above the prompt text (a permission prompt's tool name,
+    /// command and guard reason); empty when the dialog is only its question.
+    pub context: String,
     pub options: Vec<DialogOption>,
 }
 

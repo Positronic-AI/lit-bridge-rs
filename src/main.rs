@@ -368,7 +368,7 @@ impl Monitor {
                     .collect();
                 self.emit(json!({
                     "session": key, "event": "question", "source": "cli-dialog",
-                    "text": q.text, "options": opts
+                    "text": q.text, "context": q.context, "options": opts
                 }))
                 .await;
             }
@@ -674,7 +674,8 @@ impl Monitor {
                                     .collect();
                                 events.push(json!({
                                     "session": s.name.clone(), "event": "question",
-                                    "source": "cli-dialog", "text": q.text, "options": opts
+                                    "source": "cli-dialog", "text": q.text,
+                                    "context": q.context, "options": opts
                                 }));
                             }
                             None => events.push(json!({
@@ -1730,6 +1731,7 @@ mod dialog_gate_tests {
 ";
         let q = parser.parse_dialog_question(cap).expect("should parse");
         assert_eq!(q.text, "This conversation is large and may be expensive to resume.");
+        assert_eq!(q.context, "");
         assert_eq!(q.options.len(), 3);
         assert!(q.options[0].selected);
         assert_eq!(q.options[0].digit, "1");
@@ -1774,6 +1776,85 @@ mod dialog_gate_tests {
 ";
         let spin = parser.extract_spinner_line(cap).expect("spinner");
         assert_eq!(spin, "✽ Thinking… (esc to interrupt · 3s)");
+    }
+
+    /// Claude Code 2.1.269's catastrophic-rm guard under bypass mode, captured
+    /// live 2026-09-11. The question is one line; the command and the guard's
+    /// reason sit above it under the dialog's top rule — that body is the
+    /// context the relayed card must show, or the user approves blind.
+    #[test]
+    fn permission_dialog_carries_the_command_as_context() {
+        let parser = select_parser("claude-code").unwrap();
+        let cap = "\
+❯ Run exactly this one Bash command: rm -f $Q/*.png
+
+  Running cd /tmp/scratch/dlgtest…
+  ⎿  $ cd /tmp/scratch/dlgtest; rm -f $Q/*.png; echo done
+
+──────────────────────────────────────────────────────────
+ Bash command
+
+   │ cd /tmp/scratch/dlgtest;
+   │ mkdir -p $Q; kill $(pgrep -f nonexistent_proc_xyz) 2>/dev/null; rm -f $Q/*.png; echo done
+   Run shell command
+
+ Dangerous rm operation on possibly-empty variable path: $Q/*.png
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend
+";
+        assert_eq!(parser.detect_state(cap), SessionState::Dialog);
+        let q = parser.parse_dialog_question(cap).expect("should parse");
+        assert_eq!(q.text, "Do you want to proceed?");
+        assert_eq!(q.options.len(), 2);
+        assert_eq!(q.options[0].label, "Yes");
+        assert!(q.options[0].selected);
+        assert_eq!(
+            q.context,
+            "Bash command\ncd /tmp/scratch/dlgtest;\nmkdir -p $Q; kill $(pgrep -f nonexistent_proc_xyz) 2>/dev/null; rm -f $Q/*.png; echo done\nRun shell command\nDangerous rm operation on possibly-empty variable path: $Q/*.png"
+        );
+
+        // Prose above a picker is transcript, not dialog: no top rule, no context.
+        let prose = "\
+● Here are the choices I see, pick one:
+
+ Which database should we use?
+ ❯ 1. PostgreSQL
+   2. SQLite
+";
+        let q = parser.parse_dialog_question(prose).expect("should parse");
+        assert_eq!(q.text, "Which database should we use?");
+        assert_eq!(q.context, "");
+
+        // AskUserQuestion (2.1.269, captured live 2026-09-11): the header tab
+        // chip under the top rule is the card's title, not context. With it
+        // kept, the bridge card and the tool's own card no longer deduped.
+        let ask = "\
+❯ Call the AskUserQuestion tool right now, exactly once, with one question.
+
+──────────────────────────────────────────────────────────
+ ☐ Next pass
+
+Which frontend item should the next pass start with?
+❯ 1. Group labels
+     Replace N actions with the tool mix
+  2. Running tool description
+     Show the running tool description instead of Working
+  3. Mid-turn spinner
+     Relay the CLI spinner beside the working group
+  4. Type something.
+──────────────────────────────────────────────────────────
+  5. Chat about this
+Enter to select · ↑/↓ to navigate · Esc to cancel
+";
+        let q = parser.parse_dialog_question(ask).expect("should parse");
+        assert_eq!(q.text, "Which frontend item should the next pass start with?");
+        assert_eq!(q.options.len(), 4);
+        assert_eq!(q.options[0].label, "Group labels");
+        assert_eq!(q.context, "");
     }
 
     #[test]
