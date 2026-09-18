@@ -692,6 +692,29 @@ impl Monitor {
                 }
                 s.state = new_state;
             }
+            // Late parse. The block above parses a dialog once, on the frame where
+            // the state flips — and on a slow machine that frame is mid-paint (the
+            // Windows VM, 2026-09-18: excerpt was a lone "…"), so the card was never
+            // produced although the full dialog rendered a moment later. While the
+            // dialog stays up and no question has gone out, keep trying.
+            if new_state == SessionState::Dialog
+                && (s.observing || s.pending_text.is_some())
+                && !s.question_emitted
+            {
+                if let Some(q) = self.parser.parse_dialog_question(&cap) {
+                    s.question_emitted = true;
+                    let opts: Vec<Value> = q
+                        .options
+                        .iter()
+                        .map(|o| json!({"digit": o.digit, "label": o.label, "selected": o.selected}))
+                        .collect();
+                    events.push(json!({
+                        "session": s.name.clone(), "event": "question",
+                        "source": "cli-dialog", "text": q.text,
+                        "context": q.context, "options": opts
+                    }));
+                }
+            }
             // Answer follow-up: a digit was keyed into the dialog; if it only
             // moved the selection (dialog still up after a beat), confirm with
             // Enter — the one place Enter-into-a-dialog is a *chosen* action.
