@@ -427,6 +427,7 @@ impl Monitor {
                         s.echo_probe = None;
                         s.proven_w32 = None;
                         s.frozen_since = None;
+                        s.spinner_hold_logged = None;
                         s.probe_chars = 0;
                         s.last_probe_round = None;
                         let old = s.state;
@@ -776,6 +777,7 @@ impl Monitor {
                             s.echo_probe = None;
                             s.proven_w32 = None;
                             s.frozen_since = None;
+                            s.spinner_hold_logged = None;
                             s.probe_chars = 0;
                             s.last_probe_round = None;
                             let old = s.state;
@@ -851,15 +853,47 @@ impl Monitor {
                 // after the welcome screen clears (ConPTY/vt100 artifact, even
                 // on healthy turns).
                 let jsonl_submitted = s.jsonl.as_ref().map_or(false, |j| j.turn_open());
+                // Third witness: a transcript born after the pin. A resumed CLI
+                // forks a fresh `<new-id>.jsonl` that holds only metadata rows
+                // for several seconds before its first `user` row, so neither
+                // `turn_open` nor the roll can fire yet — but the prompt is in
+                // and running. Without this the loop pressed Enter twice and
+                // re-pasted twice into a turn already under way (three
+                // identical replies, jupiter #engineering 2026-09-23).
+                let fresh_transcript = s
+                    .jsonl
+                    .as_ref()
+                    .map_or(false, |j| j.new_transcript_since_pin());
                 let turn_started = jsonl_submitted
+                    || fresh_transcript
                     || self.parser.count_assistant_messages(&cap) > s.baseline_msgs;
                 let in_dialog = new_state == SessionState::Dialog;
+                // A busy spinner classifies as Idle (prompt box still on screen)
+                // yet means the CLI is working — on the paste we just sent, or on
+                // resume/compaction warm-up that will consume it. Either way an
+                // Enter or a re-paste now lands in a live turn. Hold the clock.
+                let spinner_busy = self.parser.extract_spinner_line(&cap).is_some();
                 if in_dialog {
                     s.pending_submit = Some(Instant::now()); // re-arm; never Enter into a dialog
                 } else if turn_started
                     || (new_state != SessionState::Idle && s.last_submit_try.is_some())
                 {
+                    if fresh_transcript && !jsonl_submitted {
+                        lit_bridge_rs::diag::log("SUBMIT_WITNESS", &format!("{} fresh transcript since pin", s.name));
+                    }
                     s.pending_submit = None; // submitted — turn under way
+                } else if spinner_busy && pasted_at.elapsed() >= Duration::from_millis(700) {
+                    if s.last_submit_try.is_some() || s.submit_tries > 0 {
+                        // Breadcrumb once per hold so a dark turn shows why no retry fired.
+                        if s.spinner_hold_logged.is_none() {
+                            eprintln!(
+                                "lit-bridge-rs: {} busy spinner after paste — holding submit retries",
+                                s.name
+                            );
+                            s.spinner_hold_logged = Some(Instant::now());
+                        }
+                    }
+                    s.pending_submit = Some(Instant::now()); // park the clock; verify once it clears
                 } else if pasted_at.elapsed() < Duration::from_millis(700) {
                     // Give the atomic paste+Enter its fair chance first.
                 } else if s.proven_w32.is_none() {
@@ -1805,6 +1839,44 @@ mod dialog_gate_tests {
     /// live 2026-09-11. The question is one line; the command and the guard's
     /// reason sit above it under the dialog's top rule — that body is the
     /// context the relayed card must show, or the user approves blind.
+    #[test]
+    fn typed_draft_in_the_composer_is_not_a_dialog() {
+        // games, 2026-09-23: Ben typed an answer to the reply's numbered list
+        // into the terminal and left it unsent. `❯ 1. goes blunt …` matched the
+        // selected-option pattern, the bridge held the next channel message on a
+        // dialog that did not exist, and the reply's own list became a card.
+        let parser = select_parser("claude-code").unwrap();
+        let cap = "\
+● Two things for you to decide before I build it:
+  1. At zero, does it break, or go blunt (keeps working, much slower, until repaired)?
+  2. Repair at the workbench with a little of the tool's material, or always craft a new one?
+
+✻ Cooked for 11m 1s · done 11:10 AM
+
+──────────────────────────────────────────────────────────
+❯ 1. goes blunt 2. repair at the workbench
+──────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+";
+        assert_eq!(parser.detect_state(cap), SessionState::Idle);
+
+        // A multi-line draft: only the first row carries the prompt glyph.
+        let multi = "\
+● Two things for you to decide before I build it:
+  1. At zero, does it break, or go blunt?
+  2. Repair at the workbench, or always craft a new one?
+
+✻ Cooked for 11m 1s · done 11:10 AM
+
+──────────────────────────────────────────────────────────
+❯ 1. goes blunt
+  2. repair at the workbench
+──────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+";
+        assert_eq!(parser.detect_state(multi), SessionState::Idle);
+    }
+
     #[test]
     fn permission_dialog_carries_the_command_as_context() {
         let parser = select_parser("claude-code").unwrap();

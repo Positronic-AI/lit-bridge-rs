@@ -103,6 +103,8 @@ pub struct Session {
     pub submit_tries: u8,
     /// When the CLI stopped reacting to our input (no output since a send).
     pub frozen_since: Option<Instant>,
+    /// First time the submit loop parked on a busy spinner (breadcrumb once per paste).
+    pub spinner_hold_logged: Option<Instant>,
     /// Echo-probe state for the recovery ladder: which dialect we last typed
     /// the probe character in, and when. `None` = no probe outstanding.
     pub echo_probe: Option<(bool, Instant)>,
@@ -329,6 +331,7 @@ impl Session {
             sent_at_bytes: 0,
             submit_tries: 0,
             frozen_since: None,
+            spinner_hold_logged: None,
             echo_probe: None,
             proven_w32: None,
             probe_chars: 0,

@@ -161,6 +161,25 @@ impl ClaudeV21Parser {
         let all: Vec<&str> = capture.trim().split('\n').collect();
         all[all.len().saturating_sub(10)..].join("\n")
     }
+
+    /// True when `lines[i]` is the composer row: a `❯` line drawn directly under
+    /// the input box's top rule (a blank line may sit between them). Typed-but-
+    /// unsent text lives there, so `❯ 1. goes blunt 2. repair at the workbench`
+    /// is the user's draft, not a selected dialog option. Without this check the
+    /// draft matched `re_dialog_selection`, the bridge held the channel on a
+    /// dialog that did not exist and relayed the reply's own numbered list as a
+    /// question card (games, 2026-09-23).
+    fn is_composer_row(&self, lines: &[&str], i: usize) -> bool {
+        if !lines[i].trim().starts_with('❯') {
+            return false;
+        }
+        lines[..i]
+            .iter()
+            .rev()
+            .map(|l| l.trim())
+            .find(|t| !t.is_empty())
+            .map_or(false, |t| self.re_separator.is_match(t))
+    }
 }
 
 impl TuiParser for ClaudeV21Parser {
@@ -172,14 +191,21 @@ impl TuiParser for ClaudeV21Parser {
         // Dialogs: only inspect the bottom of the screen (full-capture checks
         // false-positive on conversation text containing dialog strings).
         let all_trimmed: Vec<&str> = capture.trim().split('\n').collect();
-        let bottom_slice = &all_trimmed[all_trimmed.len().saturating_sub(10)..];
+        let bottom_start = all_trimmed.len().saturating_sub(10);
+        let bottom_slice = &all_trimmed[bottom_start..];
         let bottom = bottom_slice.join("\n");
         for s in DIALOG_STRINGS {
             if bottom.contains(s) {
                 return SessionState::Dialog;
             }
         }
-        if self.re_dialog_selection.is_match(&bottom) {
+        // A selected option row — unless the only such row is the composer
+        // holding a draft that happens to start with "N. ".
+        let selected_option = bottom_slice.iter().enumerate().any(|(i, l)| {
+            self.re_dialog_selection.is_match(l)
+                && !self.is_composer_row(&all_trimmed, bottom_start + i)
+        });
+        if selected_option {
             return SessionState::Dialog;
         }
 
@@ -798,8 +824,12 @@ impl TuiParser for ClaudeV21Parser {
         let is_boundary =
             |t: &str| self.re_separator.is_match(t) || self.re_status.is_match(t);
 
+        let cleaned_refs: Vec<&str> = cleaned.iter().map(|l| l.as_str()).collect();
         let mut rows: Vec<(usize, DialogOption)> = Vec::new();
         for (i, line) in cleaned.iter().enumerate() {
+            if self.is_composer_row(&cleaned_refs, i) {
+                continue; // the user's draft is never an option
+            }
             if let Some(caps) = self.re_dialog_option.captures(line) {
                 rows.push((
                     i,

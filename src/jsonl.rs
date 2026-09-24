@@ -66,6 +66,15 @@ pub struct JsonlWatcher {
     /// builds/mounts (static-musl, NFS/NAS) and there disables re-anchoring,
     /// stranding the turn on the dead pinned file (the dormant-channel dark turn).
     existing_at_pin: HashSet<PathBuf>,
+    /// Set by `find_rolled_transcript` when a transcript that did NOT exist at
+    /// pin time has been written since the pin — even before it holds a
+    /// conversation record. A resumed CLI forks a fresh transcript that starts
+    /// with metadata rows (`last-prompt`, `mode`, `permission-mode`) and takes
+    /// seconds to get its first `user` row; during that window the roll can't
+    /// happen yet, but the paste HAS been accepted — the submit-retry loop must
+    /// not press Enter or re-paste (jupiter #engineering, 2026-09-23: three
+    /// identical turns from two re-pastes).
+    new_since_pin: std::cell::Cell<bool>,
     /// The Claude session id this process was spawned to resume (`--resume <id>`),
     /// if any. A resumed CLI appends to its EXISTING transcript `<id>.jsonl`.
     resume_hint: Option<String>,
@@ -130,6 +139,7 @@ impl JsonlWatcher {
             pending_complete: false,
             pin_time: None,
             existing_at_pin: HashSet::new(),
+            new_since_pin: std::cell::Cell::new(false),
             resume_hint: None,
             pinned_id: None,
             turn_in_tokens: 0,
@@ -237,6 +247,9 @@ impl JsonlWatcher {
                 // A file ABSENT from the pin-time snapshot was created during this turn
                 // — the one safe re-anchor target. No `created()` call, so no born_err.
                 let is_new = !self.existing_at_pin.contains(&p);
+                if is_new {
+                    self.new_since_pin.set(true);
+                }
                 let conv = is_conversation_transcript(&p);
                 // The established/resumed transcript is pre-existing (never
                 // `is_new`) yet is exactly where this session's turns land — a
@@ -308,6 +321,7 @@ impl JsonlWatcher {
         // absence from this set — no dependence on `created()` birth time, which is
         // unreadable on static-musl / NAS and there leaves the turn dark.
         self.existing_at_pin = Self::snapshot_jsonl(&self.project_dir);
+        self.new_since_pin.set(false);
         // Record exactly which transcript got pinned (and at what offset) so a turn
         // whose JSONL completion never fires can be traced to a stale/wrong-file pin
         // vs a mid-turn session roll — without this, the watcher is a black box.
@@ -341,6 +355,14 @@ impl JsonlWatcher {
     /// completion fallback must be blocked while this holds.
     pub fn turn_open(&self) -> bool {
         self.open
+    }
+
+    /// True once a transcript born after this turn's pin has been written —
+    /// the CLI is running THIS turn in a fresh file (a resume fork) even though
+    /// the roll onto it may still be pending. A "submitted" witness for the
+    /// submit-retry loop; see the field doc.
+    pub fn new_transcript_since_pin(&self) -> bool {
+        self.new_since_pin.get()
     }
 
     /// Advance to EOF of the active transcript and drop any in-flight turn state,
@@ -870,6 +892,46 @@ mod tests {
         w.begin_turn();
         assert_eq!(w.file.as_ref(), Some(&fresh), "begin_turn must pin the rolled transcript");
         assert!(w.resume_hint.is_none(), "resume hint retired after the roll");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fresh_metadata_only_transcript_is_a_submit_witness_before_it_can_roll() {
+        // jupiter #engineering 2026-09-23: `--resume <old>` forked a NEW transcript
+        // that held only metadata rows (`last-prompt`, `mode`, `permission-mode`)
+        // for ~4 s before its first `user` row. The roll rightly waits for a
+        // conversation row, but the submit-retry loop treated "no JSONL turn" as
+        // "not submitted" and re-pasted the prompt twice → three identical turns.
+        // The watcher must expose "a fresh transcript exists since the pin" as a
+        // witness in that window, and still roll once the user row lands.
+        let dir = std::env::temp_dir().join(format!("lbrs-fresh-meta-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = write_conv(&dir, "fb89a74e-0000-0000-0000-000000000000.jsonl");
+        let mut w = JsonlWatcher::new(dir.clone());
+        w.set_resume_hint(Some("fb89a74e-0000-0000-0000-000000000000".to_string()));
+        w.begin_turn();
+        assert_eq!(w.file.as_ref(), Some(&old));
+        assert!(!w.new_transcript_since_pin(), "nothing new at pin time");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // The forked transcript appears with metadata rows only.
+        let fresh = dir.join("654c6919-0000-0000-0000-000000000000.jsonl");
+        std::fs::write(
+            &fresh,
+            "{\"type\":\"last-prompt\"}\n{\"type\":\"mode\"}\n{\"type\":\"permission-mode\"}\n",
+        )
+        .unwrap();
+        let evs = w.poll();
+        assert!(evs.is_empty());
+        assert_eq!(w.file.as_ref(), Some(&old), "no roll yet: no conversation row");
+        assert!(w.new_transcript_since_pin(), "but the fresh file is a submit witness");
+        // The user row lands → the roll happens as before.
+        append(&fresh, "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}");
+        let _ = w.poll();
+        assert_eq!(w.file.as_ref(), Some(&fresh), "rolls once the conversation row exists");
+        // A new turn resets the witness.
+        w.begin_turn();
+        assert!(!w.new_transcript_since_pin());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
