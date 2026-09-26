@@ -1878,6 +1878,34 @@ mod dialog_gate_tests {
     }
 
     #[test]
+    fn turn_complete_ignores_a_draft_in_the_composer() {
+        // games, 2026-09-26: the JSONL never anchored (wrong pin) so the TUI
+        // fallback was the only way to close the turn, and Ben had typed
+        // "start the dev server for me" into the terminal without sending it.
+        // `turn_complete` took that composer row as the last user line, found no
+        // completion marker after it, and the turn only closed at the 600 s cap.
+        let parser = select_parser("claude-code").unwrap();
+        let cap = "\
+● Sail is in ~/sail-web. That's the web version from 9/24.
+
+  - Live site: https://sail-web.ben-vierck.workers.dev, which works from anywhere.
+  - Locally: run cd ~/sail-web && npm run dev.
+
+✻ Worked for 10s · done 11:25 AM
+
+──────────────────────────────────────────────────────────
+❯ start the dev server for me
+──────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+";
+        assert!(parser.turn_complete(cap), "a draft in the composer must not hide the completion");
+        assert_eq!(parser.detect_state(cap), SessionState::Idle);
+        // The same screen with an empty composer completes as before.
+        let empty = cap.replace("❯ start the dev server for me", "❯ ");
+        assert!(parser.turn_complete(&empty));
+    }
+
+    #[test]
     fn permission_dialog_carries_the_command_as_context() {
         let parser = select_parser("claude-code").unwrap();
         let cap = "\

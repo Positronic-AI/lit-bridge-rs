@@ -727,7 +727,15 @@ impl TuiParser for ClaudeV21Parser {
         let mut last_user = None;
         for i in (0..lines.len()).rev() {
             let t = lines[i].trim();
-            if self.re_user.is_match(t) && t.chars().count() > 2 {
+            // The composer row holds an unsent draft, not a submitted prompt.
+            // Treating it as the last user line put the completion marker
+            // "before" it and blocked the TUI fallback until the 600 s cap
+            // (games, 2026-09-26: a draft sat in the box while a dark turn
+            // waited; the reply was persisted 10 minutes late).
+            if self.re_user.is_match(t)
+                && t.chars().count() > 2
+                && !self.is_composer_row(&lines, i)
+            {
                 last_user = Some(i);
                 break;
             }

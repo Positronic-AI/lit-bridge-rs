@@ -5,7 +5,7 @@
 //! structured tool_use/tool_result events — the source of truth the TUI scrape can't
 //! match. This is why responses come out without `●`/`✻` chrome.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -59,13 +59,24 @@ pub struct JsonlWatcher {
     /// cursor) and the bridge stops observing, dropping the real text. So we defer:
     /// hold the turn open and complete once the text actually arrives.
     pending_complete: bool,
-    /// Snapshot of every `.jsonl` that existed in `project_dir` at `begin_turn`.
-    /// A mid-turn session roll is recognised by ABSENCE from this set (the file
-    /// was created after the pin), which is filesystem- and libc-independent —
-    /// unlike birth time (`created()`), which is silently unreadable on some
-    /// builds/mounts (static-musl, NFS/NAS) and there disables re-anchoring,
-    /// stranding the turn on the dead pinned file (the dormant-channel dark turn).
-    existing_at_pin: HashSet<PathBuf>,
+    /// Snapshot of every `.jsonl` that existed in `project_dir` at `begin_turn`,
+    /// with its length at that moment. A mid-turn session roll is recognised by
+    /// ABSENCE from this map (the file was created after the pin), which is
+    /// filesystem- and libc-independent — unlike birth time (`created()`), which
+    /// is silently unreadable on some builds/mounts (static-musl, NFS/NAS) and
+    /// there disables re-anchoring, stranding the turn on the dead pinned file
+    /// (the dormant-channel dark turn). The length lets a PRE-EXISTING sibling
+    /// that grows during the turn be adopted from exactly where the turn began,
+    /// never replaying its history (games, 2026-09-26: the first begin_turn of a
+    /// fresh spawn pinned a dead night-time transcript one second before the CLI
+    /// created its own; that guess became the sticky pin and every later turn's
+    /// reply landed in a file that was "not new" and "not known" → dark turn,
+    /// 300 s mux timeout, reply persisted 10 min late by the 600 s TUI cap).
+    existing_at_pin: HashMap<PathBuf, u64>,
+    /// `pos` as set by the last `begin_turn`: while `pos` still equals it, the
+    /// pinned file has produced nothing this turn, so a growing sibling is the
+    /// CLI's real transcript rather than a concurrent session.
+    pin_pos: u64,
     /// Set by `find_rolled_transcript` when a transcript that did NOT exist at
     /// pin time has been written since the pin — even before it holds a
     /// conversation record. A resumed CLI forks a fresh transcript that starts
@@ -138,7 +149,8 @@ impl JsonlWatcher {
             open: false,
             pending_complete: false,
             pin_time: None,
-            existing_at_pin: HashSet::new(),
+            existing_at_pin: HashMap::new(),
+            pin_pos: 0,
             new_since_pin: std::cell::Cell::new(false),
             resume_hint: None,
             pinned_id: None,
@@ -190,20 +202,22 @@ impl JsonlWatcher {
         cands.into_iter().next().map(|(_, p)| p) // fallback: newest overall
     }
 
-    /// Set of all `.jsonl` paths in `dir` right now — captured at `begin_turn` so a
-    /// roll target is recognised by absence (created after the pin). Only the dir
-    /// listing is needed, so this works regardless of build target or mount type.
-    fn snapshot_jsonl(dir: &Path) -> HashSet<PathBuf> {
-        let mut set = HashSet::new();
+    /// Every `.jsonl` path in `dir` right now with its length — captured at
+    /// `begin_turn` so a roll target is recognised by absence (created after the
+    /// pin) and a pre-existing file's growth since the pin is measurable. Only the
+    /// dir listing is needed, so this works regardless of build target or mount type.
+    fn snapshot_jsonl(dir: &Path) -> HashMap<PathBuf, u64> {
+        let mut map = HashMap::new();
         if let Ok(rd) = fs::read_dir(dir) {
             for entry in rd.flatten() {
                 let p = entry.path();
                 if p.extension().map(|e| e == "jsonl").unwrap_or(false) {
-                    set.insert(p);
+                    let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    map.insert(p, len);
                 }
             }
         }
-        set
+        map
     }
 
     /// Detect a mid-turn session roll: the response is being written to a transcript
@@ -219,10 +233,18 @@ impl JsonlWatcher {
     /// static-musl builds and NFS/NAS mounts, and there it stranded the turn on the
     /// dead pinned file (the dormant-channel dark turn). Set-absence needs only the
     /// directory listing, which always works.
-    fn find_rolled_transcript(&self) -> Option<PathBuf> {
+    ///
+    /// Returns the target and the offset to read it from: 0 for a file born after
+    /// the pin, its pin-time length for a pre-existing one — so only bytes written
+    /// during THIS turn are ever read from a re-anchor target.
+    fn find_rolled_transcript(&self) -> Option<(PathBuf, u64)> {
         let pin_time = self.pin_time?;
         let cur = self.file.as_ref();
-        let mut best: Option<(SystemTime, PathBuf)> = None;
+        // Nothing has arrived on the pinned file this turn. A pre-existing
+        // sibling that IS receiving conversation rows is then the CLI's real
+        // transcript (the pin guessed wrong), not a second session racing us.
+        let pinned_silent = self.pos == self.pin_pos;
+        let mut best: Option<(SystemTime, PathBuf, u64)> = None;
         // DIAGNOSTIC (temp): record siblings written THIS turn that we declined to
         // re-anchor onto, so a dark turn shows exactly why the roll target was passed
         // over. Gated on mtime>pin below, so idle polls and stale corpses stay quiet.
@@ -245,12 +267,23 @@ impl JsonlWatcher {
                     continue;
                 }
                 // A file ABSENT from the pin-time snapshot was created during this turn
-                // — the one safe re-anchor target. No `created()` call, so no born_err.
-                let is_new = !self.existing_at_pin.contains(&p);
+                // — a safe re-anchor target read from 0. No `created()` call, so no born_err.
+                let at_pin = self.existing_at_pin.get(&p).copied();
+                let is_new = at_pin.is_none();
                 if is_new {
                     self.new_since_pin.set(true);
                 }
-                let conv = is_conversation_transcript(&p);
+                // A pre-existing file is read from its pin-time length: everything
+                // before that is history (the flap/replay hazard), everything after
+                // it was written during this turn.
+                let start = at_pin.unwrap_or(0);
+                let grew = md.len() > start;
+                // Conversation rows written since the pin (the whole file for a new
+                // one). Checked over the growth, not a fixed tail window: a fresh
+                // transcript's tail can be one >64 KiB attachment row plus system
+                // markers, which hid the `user`/`assistant` rows above it and made
+                // the fresh file "not a conversation" for the only turn it was new.
+                let conv = grew && has_conversation_since(&p, start);
                 // The established/resumed transcript is pre-existing (never
                 // `is_new`) yet is exactly where this session's turns land — a
                 // safe re-anchor target even though it isn't new.
@@ -261,16 +294,16 @@ impl JsonlWatcher {
                             || self.resume_hint.as_deref() == Some(st)
                     })
                     .unwrap_or(false);
-                if (is_new || is_known) && conv {
+                if conv && (is_new || is_known || pinned_silent) {
                     // Order by mtime (always readable) to pick the freshest roll target.
                     let key = md.modified().unwrap_or(pin_time);
-                    if best.as_ref().map(|(t, _)| key > *t).unwrap_or(true) {
-                        best = Some((key, p));
+                    if best.as_ref().map(|(t, _, _)| key > *t).unwrap_or(true) {
+                        best = Some((key, p, start));
                     }
                 } else {
                     rejects.push(format!(
-                        "{}:is_new={} conv={} mtime_ms={}",
-                        short(&p), is_new, conv,
+                        "{}:is_new={} conv={} grew={} pinned_silent={} mtime_ms={}",
+                        short(&p), is_new, conv, grew, pinned_silent,
                         md.modified().ok().map(ms).unwrap_or(0)
                     ));
                 }
@@ -287,7 +320,7 @@ impl JsonlWatcher {
                 ),
             );
         }
-        best.map(|(_, p)| p)
+        best.map(|(_, p, start)| (p, start))
     }
 
     /// Call when a new send starts — find/reset the active transcript at its current EOF.
@@ -313,6 +346,7 @@ impl JsonlWatcher {
             .and_then(|f| fs::metadata(f).ok())
             .map(|m| m.len())
             .unwrap_or(0);
+        self.pin_pos = self.pos;
         // Stamp the pin moment so poll() can recognise a transcript born mid-turn
         // (a session roll) and distinguish it from a pre-existing newer file.
         self.pin_time = Some(SystemTime::now());
@@ -473,16 +507,17 @@ impl JsonlWatcher {
             // `find_rolled_transcript` returns a file ONLY if it was born after this
             // turn's pin, which means it cannot replay historical entries — so it is
             // safe to re-anchor onto it from offset 0 and read the real response.
-            if let Some(rolled) = self.find_rolled_transcript() {
+            if let Some((rolled, start)) = self.find_rolled_transcript() {
                 crate::diag::log(
                     "ROLL",
                     &format!(
-                        "from={} to={}",
+                        "from={} to={} pos={}",
                         self.file
                             .as_ref()
                             .map(|f| f.display().to_string())
                             .unwrap_or_else(|| "<none>".into()),
-                        rolled.display()
+                        rolled.display(),
+                        start
                     ),
                 );
                 // The CLI now writes THIS file for the rest of its life (a resume
@@ -495,8 +530,10 @@ impl JsonlWatcher {
                 }
                 self.resume_hint = None;
                 self.file = Some(rolled);
-                self.pos = 0;
-                // Fall through: read the rolled file from the start this same poll.
+                // 0 for a file born this turn; a pre-existing sibling starts at its
+                // pin-time length so its history is never replayed.
+                self.pos = start;
+                // Fall through: read the rolled file from there this same poll.
             } else {
                 return Vec::new();
             }
@@ -769,6 +806,39 @@ fn is_conversation_transcript(path: &Path) -> bool {
     false
 }
 
+/// True when the bytes of `path` from `from` to EOF hold at least one
+/// conversation row (`user`/`assistant`/`human`). Unlike the fixed 64 KiB tail
+/// scan of `is_conversation_transcript`, this covers exactly the region written
+/// since a pin, however large one row inside it is (a pasted-context attachment
+/// row can exceed 64 KiB on its own). Reads at most 8 MiB.
+fn has_conversation_since(path: &Path, from: u64) -> bool {
+    let mut fh = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    if fh.seek(SeekFrom::Start(from)).is_err() {
+        return false;
+    }
+    let mut buf = Vec::new();
+    if fh.take(8 * 1024 * 1024).read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&buf);
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(line) {
+            match v.get("type").and_then(|t| t.as_str()) {
+                Some("assistant") | Some("user") | Some("human") => return true,
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 fn flatten_tool_result(content: Option<&Value>) -> String {
     match content {
         Some(Value::String(s)) => s.clone(),
@@ -932,6 +1002,96 @@ mod tests {
         // A new turn resets the witness.
         w.begin_turn();
         assert!(!w.new_transcript_since_pin());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fresh_spawn_transcript_hidden_by_a_giant_attachment_row_still_rolls() {
+        // games 2026-09-26, turn 1: a fresh spawn's first begin_turn pinned the
+        // dead night-time transcript (newest by mtime) a second before the CLI
+        // created its own file. The new file's tail was a 113 KB attachment row +
+        // system markers, so the 64 KiB tail scan saw no conversation row and the
+        // roll was refused for the only turn the file counted as new.
+        let dir = std::env::temp_dir().join(format!("lbrs-giant-row-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dead = write_conv(&dir, "ff83ad3e-0000-0000-0000-000000000000.jsonl");
+        let mut w = JsonlWatcher::new(dir.clone());
+        w.begin_turn();
+        assert_eq!(w.file.as_ref(), Some(&dead));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let fresh = dir.join("ef19d2de-0000-0000-0000-000000000000.jsonl");
+        std::fs::write(&fresh, "{\"type\":\"mode\"}\n").unwrap();
+        append(&fresh, "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}");
+        append(&fresh, &assistant("Reply A"));
+        let big = format!("{{\"type\":\"attachment\",\"blob\":\"{}\"}}", "x".repeat(120_000));
+        append(&fresh, &big);
+        append(&fresh, "{\"type\":\"system\",\"subtype\":\"turn_duration\"}");
+        append(&fresh, "{\"type\":\"permission-mode\"}");
+        let evs = w.poll();
+        assert_eq!(w.file.as_ref(), Some(&fresh), "must roll onto the fresh transcript");
+        assert_eq!(completes(&evs), vec!["Reply A"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pre_existing_sibling_that_grows_while_the_pin_is_silent_is_adopted_from_its_pin_length() {
+        // games 2026-09-26, turns 2–3: the wrong first pin became the sticky
+        // `pinned_id`, so the CLI's real transcript was "not new" and "not known"
+        // on every later turn and each reply went dark. A pre-existing sibling
+        // that receives conversation rows while the pinned file stays silent IS
+        // the session's transcript; adopt it from its pin-time length so none of
+        // its history is replayed, and learn it for the next turn.
+        let dir = std::env::temp_dir().join(format!("lbrs-grow-adopt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The real transcript exists first (older by mtime) and already holds history.
+        let real = write_conv(&dir, "ef19d2de-1111-0000-0000-000000000000.jsonl");
+        append(&real, &assistant("OLD reply that must never replay"));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let dead = write_conv(&dir, "ff83ad3e-1111-0000-0000-000000000000.jsonl");
+        let mut w = JsonlWatcher::new(dir.clone());
+        w.begin_turn();
+        assert_eq!(w.file.as_ref(), Some(&dead), "heuristic pins the newer dead file");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // A metadata-only touch of the sibling is not enough to hop.
+        append(&real, "{\"type\":\"file-history-snapshot\"}");
+        assert!(w.poll().is_empty());
+        assert_eq!(w.file.as_ref(), Some(&dead), "non-conversation growth: stay put");
+        // This turn's prompt and reply land in the sibling.
+        append(&real, "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"Which folder?\"}}");
+        append(&real, &assistant("Sail is in ~/sail-web."));
+        let evs = w.poll();
+        assert_eq!(w.file.as_ref(), Some(&real), "adopt the growing sibling");
+        assert_eq!(completes(&evs), vec!["Sail is in ~/sail-web."], "only this turn's rows are read");
+        // The adopted file is the pin from now on.
+        w.begin_turn();
+        assert_eq!(w.file.as_ref(), Some(&real));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_sibling_growing_while_the_pinned_file_is_live_is_left_alone() {
+        // Guard for the adoption rule: once the pinned file has produced rows this
+        // turn it is the live transcript, and a concurrently written sibling must
+        // not steal the turn.
+        let dir = std::env::temp_dir().join(format!("lbrs-grow-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let other = write_conv(&dir, "aaaa1111-0000-0000-0000-000000000000.jsonl");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let live = write_conv(&dir, "bbbb2222-0000-0000-0000-000000000000.jsonl");
+        let mut w = JsonlWatcher::new(dir.clone());
+        w.begin_turn();
+        assert_eq!(w.file.as_ref(), Some(&live));
+        append(&live, "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\",\"input\":{}}],\"stop_reason\":\"tool_use\"}}");
+        let _ = w.poll(); // the pinned file is producing this turn
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        append(&other, "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"elsewhere\"}}");
+        append(&other, &assistant("unrelated"));
+        let evs = w.poll();
+        assert_eq!(w.file.as_ref(), Some(&live), "must not hop while the pinned file is live");
+        assert!(completes(&evs).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
