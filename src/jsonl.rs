@@ -39,6 +39,24 @@ pub fn cc_project_dir(working_dir: &str, config_dir: Option<&str>) -> PathBuf {
     base.join("projects").join(slug)
 }
 
+/// A `user` row the CLI writes when a running turn is interrupted with Esc:
+/// every text block is an interruption marker. Real user input never is.
+pub fn is_interrupt_row(msg: &Value) -> bool {
+    let texts: Vec<&str> = match msg.get("content") {
+        Some(Value::String(s)) => vec![s.as_str()],
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+            .collect(),
+        _ => Vec::new(),
+    };
+    !texts.is_empty()
+        && texts
+            .iter()
+            .all(|t| t.trim_start().starts_with("[Request interrupted by user"))
+}
+
 pub struct JsonlWatcher {
     project_dir: PathBuf,
     file: Option<PathBuf>,
@@ -685,6 +703,22 @@ impl JsonlWatcher {
                             .any(|b| b.get("type").and_then(|v| v.as_str()) == Some("text")),
                         _ => false,
                     };
+                    // Esc in the terminal: the CLI records the interruption as a `user`
+                    // row ("[Request interrupted by user]" / "… for tool use"). That is
+                    // the END of the running turn, not the start of one — the CLI is
+                    // back at its prompt with nothing running. Treating it as a boundary
+                    // left `open` true, and since the screen state now defers to the
+                    // transcript (`effective_state`), the daemon would have reported
+                    // "thinking" at an idle prompt until the next real turn.
+                    if is_user_turn && is_interrupt_row(&msg) {
+                        crate::diag::log("TURN", "interrupted by user — turn closed");
+                        self.turn_text_parts.clear();
+                        self.emitted_tool_ids.clear();
+                        self.open = false;
+                        self.pending_complete = false;
+                        self.reset_turn_usage();
+                        continue;
+                    }
                     // BACK-TO-BACK TURNS IN ONE BATCH: queued input (a /loop fire, a
                     // typed line, an injected follow-up) starts the next CLI turn the
                     // instant the prior reply lands, so one poll can carry `end_turn` +
@@ -1135,6 +1169,33 @@ mod tests {
         let evs = w.poll();
         assert_eq!(completes(&evs), vec!["Reply B"], "follow-on turn completes on its own");
         assert!(!w.turn_open());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_interrupt_row_closes_the_turn_instead_of_opening_one() {
+        // Esc mid-turn (2026-09-26): the CLI logs "[Request interrupted by user]" as
+        // a `user` row. It must leave the transcript CLOSED so the daemon reports the
+        // idle prompt truthfully and the API's idle grace can end the turn.
+        let dir = std::env::temp_dir().join(format!("lbrs-intr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = write_conv(&dir, "aaaaaaaa-0000-0000-0000-000000000000.jsonl");
+        let mut w = JsonlWatcher::new(dir.clone());
+        w.begin_turn();
+
+        append(&t, "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"do the thing\"}}");
+        let _ = w.poll();
+        assert!(w.turn_open(), "a real user line opens the turn");
+
+        append(&t, "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"[Request interrupted by user for tool use]\"}]}}");
+        let evs = w.poll();
+        assert!(completes(&evs).is_empty(), "an interruption completes nothing");
+        assert!(!w.turn_open(), "the interruption closes the turn");
+
+        append(&t, "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"again\"}}");
+        let _ = w.poll();
+        assert!(w.turn_open(), "the next real user line opens a fresh turn");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

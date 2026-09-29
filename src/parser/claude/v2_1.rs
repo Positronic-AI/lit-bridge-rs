@@ -870,10 +870,14 @@ impl TuiParser for ClaudeV21Parser {
 
         // A real picker numbers from 1 with ≥2 consecutive options; the
         // increment-by-one grouping already guarantees the digits are unique.
-        let (start, options) = sequences
-            .into_iter()
-            .rev()
-            .find(|(_, opts)| opts.len() >= 2 && opts[0].digit == "1")?;
+        // It also carries the cursor: one of its rows is drawn `❯ N.`. A
+        // numbered list in the reply above has none, and without this check
+        // that list was relayed as a question card whenever something else
+        // put the screen in the dialog state (lit-platform, 2026-09-26: the
+        // QA steps of the previous reply, after an Esc in the terminal).
+        let (start, options) = sequences.into_iter().rev().find(|(_, opts)| {
+            opts.len() >= 2 && opts[0].digit == "1" && opts.iter().any(|o| o.selected)
+        })?;
 
         // Question text: the non-empty lines directly above the options, stopping
         // at anything that reads as conversation/chrome rather than dialog prose.

@@ -651,7 +651,7 @@ impl Monitor {
             if cap != s.last {
                 s.last_change = Instant::now();
             }
-            let new_state = self.parser.detect_state(&cap);
+            let new_state = effective_state(self.parser.detect_state(&cap), s.jsonl_turn_open());
             if new_state != s.state {
                 events.push(json!({
                     "session": s.name.clone(),
@@ -660,6 +660,12 @@ impl Monitor {
                     "to": new_state.as_str()
                 }));
                 if new_state == SessionState::Dialog {
+                    // Evidence for a false positive: the screen that read as a
+                    // dialog is gone a second later, so record its bottom now.
+                    lit_bridge_rs::diag::log(
+                        "DIALOG",
+                        &format!("{} from={} bottom={}", s.name, s.state.as_str(), bottom_excerpt(&cap)),
+                    );
                     // A dialog appeared mid-turn (AskUserQuestion) or over a held
                     // message: relay it as structure if the shape is parseable,
                     // else log it for the corpus. Startup dialogs (neither
@@ -1749,9 +1755,39 @@ async fn main() -> Result<()> {
         .await
 }
 
+/// The state we report for a session: the screen's reading, corrected by the
+/// transcript. While the JSONL shows a turn open the CLI IS working, whatever
+/// the prompt box looks like — a turn submitted behind a finishing background
+/// agent kept the plain prompt on screen (no spinner, no "esc to interrupt")
+/// for 16 s of first-token wait (#games 2026-09-26 15:40); the daemon reported
+/// idle, the API's 8 s idle grace ended the turn with zero chunks, and the web
+/// showed "No response received" while the terminal streamed the real reply.
+/// `Dialog`, `Responding`, `Dead` and `Starting` are left alone: only a bare
+/// idle prompt is contradicted, and only by an open transcript turn.
+fn effective_state(screen: SessionState, transcript_turn_open: bool) -> SessionState {
+    if screen == SessionState::Idle && transcript_turn_open {
+        SessionState::Thinking
+    } else {
+        screen
+    }
+}
+
 #[cfg(test)]
 mod dialog_gate_tests {
     use super::*;
+
+    #[test]
+    fn an_open_transcript_turn_overrides_an_idle_prompt() {
+        // 2026-09-26 #games: prompt submitted while a background agent was finishing;
+        // the screen kept the bare prompt for 16 s and the daemon said idle.
+        assert_eq!(effective_state(SessionState::Idle, true), SessionState::Thinking);
+        assert_eq!(effective_state(SessionState::Idle, false), SessionState::Idle);
+        // Only a bare idle prompt is contradicted by the transcript.
+        assert_eq!(effective_state(SessionState::Dialog, true), SessionState::Dialog);
+        assert_eq!(effective_state(SessionState::Responding, true), SessionState::Responding);
+        assert_eq!(effective_state(SessionState::Dead, true), SessionState::Dead);
+        assert_eq!(effective_state(SessionState::Starting, true), SessionState::Starting);
+    }
 
     /// The screen the 2026-07-24 morning incident booted into: `--resume` of a
     /// near-full session presents a numbered-option question. The dispatch gate
@@ -1998,6 +2034,23 @@ Enter to select · ↑/↓ to navigate · Esc to cancel
         assert!(parser
             .parse_dialog_question(" 3. a step\n 4. another step\n")
             .is_none());
+        // A numbered list without a cursor row is the reply's own prose, even
+        // with the side panel drawn beside it and an interrupt note below.
+        let reply_list = "\
+  QA in #games, your side                                   1 file changed          ✕
+
+  1. End a turn while a background agent is still running.  .lit/CLAUDE.md
+  2. Press Esc on a running turn in the terminal.           ─────────────────────────
+
+❯ Let's test it here.
+  ⎿  Interrupted · What should Claude do instead?
+
+──────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on
+";
+        assert!(parser.parse_dialog_question(reply_list).is_none());
         // A single numbered line is not a picker.
         assert!(parser.parse_dialog_question(" 1. only one\n").is_none());
     }
