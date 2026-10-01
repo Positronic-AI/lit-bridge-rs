@@ -6,3 +6,4 @@ pub mod jsonl;
 pub mod parser;
 pub mod reflow;
 pub mod session;
+pub mod subagents;

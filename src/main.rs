@@ -651,6 +651,16 @@ impl Monitor {
             if cap != s.last {
                 s.last_change = Instant::now();
             }
+            // Background agents outlive the turn that launched them, so this runs
+            // whether or not a turn is being observed. Tagged organic + channel so
+            // the API relays it with no dispatch consumer attached.
+            if let Some(mut ev) = s.poll_background_agents() {
+                if let Some((_, cid)) = s.name.rsplit_once(':') {
+                    ev["organic"] = json!(true);
+                    ev["channel_id"] = json!(cid);
+                    events.push(ev);
+                }
+            }
             let new_state = effective_state(self.parser.detect_state(&cap), s.jsonl_turn_open());
             if new_state != s.state {
                 events.push(json!({

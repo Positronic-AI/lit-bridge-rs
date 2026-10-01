@@ -471,6 +471,12 @@ impl JsonlWatcher {
         f.file_stem().map(|s| s.to_string_lossy().to_string())
     }
 
+    /// Where Claude Code keeps this session's sub-agent transcripts:
+    /// `<project>/<session-id>/subagents`. See `crate::subagents`.
+    pub fn subagents_dir(&self) -> Option<PathBuf> {
+        Some(self.project_dir.join(self.get_session_id()?).join("subagents"))
+    }
+
     fn read_new(&mut self) -> Option<String> {
         let f = self.file.clone()?;
         let mut fh = fs::File::open(&f).ok()?;

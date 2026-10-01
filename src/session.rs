@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize, PtySystem, SlavePty};
@@ -83,6 +83,11 @@ pub struct Session {
     pub model: Option<String>,
     /// Watches Claude Code's JSONL transcript for clean content + tool events.
     pub jsonl: Option<JsonlWatcher>,
+    /// Background agents last reported for this session: when they were last
+    /// scanned, when last emitted, and the signature of what was emitted.
+    pub agents_checked: Option<Instant>,
+    pub agents_emitted: Option<Instant>,
+    pub agents_sig: String,
     writer: Box<dyn Write + Send>,
     /// Set when the CLI requests win32-input-mode (`ESC[?9001h`) — on Windows the
     /// interactive Claude TUI negotiates this and ignores legacy VT keystrokes, so
@@ -322,6 +327,9 @@ impl Session {
             last_thinking: None,
             model: None,
             jsonl,
+            agents_checked: None,
+            agents_emitted: None,
+            agents_sig: String::new(),
             writer,
             win32,
             screen,
@@ -598,6 +606,39 @@ impl Session {
     /// True while the JSONL transcript shows the turn still open (authoritative).
     pub fn jsonl_turn_open(&self) -> bool {
         self.jsonl.as_ref().map(|j| j.turn_open()).unwrap_or(false)
+    }
+
+    /// The running background agents of this session, as an `agents` event, when
+    /// the set changed since the last report — or every 30 s while it is
+    /// non-empty, so a restarted API relearns it and elapsed times stay fresh.
+    /// Scans at most every 2 s. `None` = nothing to say.
+    pub fn poll_background_agents(&mut self) -> Option<Value> {
+        let now = Instant::now();
+        if self.agents_checked.map_or(false, |t| now.duration_since(t) < Duration::from_secs(2)) {
+            return None;
+        }
+        self.agents_checked = Some(now);
+        let dir = self.jsonl.as_ref()?.subagents_dir()?;
+        let agents = crate::subagents::running(&dir);
+        let sig = agents.iter().map(|a| format!("{}:{}", a.id, a.started_ms)).collect::<Vec<_>>().join(",");
+        let changed = sig != self.agents_sig;
+        let refresh = !agents.is_empty()
+            && self.agents_emitted.map_or(true, |t| now.duration_since(t) >= Duration::from_secs(30));
+        if !changed && !refresh {
+            return None;
+        }
+        self.agents_sig = sig;
+        self.agents_emitted = Some(now);
+        let list: Vec<Value> = agents
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "id": a.id, "type": a.agent_type, "description": a.description,
+                    "started_ms": a.started_ms, "last_ms": a.last_ms,
+                })
+            })
+            .collect();
+        Some(serde_json::json!({"session": self.name.clone(), "event": "agents", "agents": list}))
     }
 
     /// Poll the JSONL transcript for new tool/text/completion events (clean content).
