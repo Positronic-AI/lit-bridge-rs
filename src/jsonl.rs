@@ -95,6 +95,10 @@ pub struct JsonlWatcher {
     /// pinned file has produced nothing this turn, so a growing sibling is the
     /// CLI's real transcript rather than a concurrent session.
     pin_pos: u64,
+    /// A turn_complete has been emitted since this pin (or since the last user
+    /// row opened a turn). A transcript roll seen in that state replays a reply
+    /// already delivered, so it is adopted at its end, not read.
+    completed_since_pin: bool,
     /// Set by `find_rolled_transcript` when a transcript that did NOT exist at
     /// pin time has been written since the pin — even before it holds a
     /// conversation record. A resumed CLI forks a fresh transcript that starts
@@ -169,6 +173,7 @@ impl JsonlWatcher {
             pin_time: None,
             existing_at_pin: HashMap::new(),
             pin_pos: 0,
+            completed_since_pin: false,
             new_since_pin: std::cell::Cell::new(false),
             resume_hint: None,
             pinned_id: None,
@@ -390,6 +395,7 @@ impl JsonlWatcher {
         self.turn_text_parts.clear();
         self.open = false;
         self.pending_complete = false;
+        self.completed_since_pin = false;
         self.reset_turn_usage();
     }
 
@@ -435,6 +441,7 @@ impl JsonlWatcher {
         self.turn_text_parts.clear();
         self.open = false;
         self.pending_complete = false;
+        self.completed_since_pin = false;
         self.reset_turn_usage();
     }
 
@@ -453,6 +460,7 @@ impl JsonlWatcher {
         );
         self.open = false;
         self.pending_complete = false;
+        self.completed_since_pin = true;
         let mut ev = json!({"event": "turn_complete", "content": content});
         if self.turn_usage_seen {
             ev["usage"] = json!({
@@ -553,9 +561,26 @@ impl JsonlWatcher {
                     self.pinned_id = Some(stem.to_string());
                 }
                 self.resume_hint = None;
-                self.file = Some(rolled);
                 // 0 for a file born this turn; a pre-existing sibling starts at its
                 // pin-time length so its history is never replayed.
+                //
+                // Unless this turn is ALREADY CLOSED. The CLI can fork the whole
+                // conversation into a fresh transcript right after a reply lands
+                // (#patent 2026-10-26 15:44: `end_turn` on the pinned file, then
+                // 300 ms later a new file carrying the same user row + the same
+                // reply). Reading that from 0 re-opened the turn on its user row
+                // and emitted the reply's turn_complete a SECOND time — which the
+                // home, no longer owning a command, took for an organic follow-on
+                // and persisted as a duplicate message. A closed turn has nothing
+                // left to read: adopt the file as the pin and continue from its end.
+                let start = if !self.completed_since_pin {
+                    start
+                } else {
+                    let eof = fs::metadata(&rolled).map(|m| m.len()).unwrap_or(start);
+                    crate::diag::log("ROLL", &format!("turn already closed — adopting at eof={}", eof));
+                    eof
+                };
+                self.file = Some(rolled);
                 self.pos = start;
                 // Fall through: read the rolled file from there this same poll.
             } else {
@@ -749,6 +774,7 @@ impl JsonlWatcher {
                         self.emitted_tool_ids.clear();
                         self.open = true;
                         self.pending_complete = false;
+                        self.completed_since_pin = false;
                         self.reset_turn_usage();
                     }
                     if let Some(blocks) = msg.get("content").and_then(|v| v.as_array()) {
@@ -1002,6 +1028,54 @@ mod tests {
         w.begin_turn();
         assert_eq!(w.file.as_ref(), Some(&fresh), "begin_turn must pin the rolled transcript");
         assert!(w.resume_hint.is_none(), "resume hint retired after the roll");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_roll_after_the_turn_closed_adopts_the_new_file_without_replaying_it() {
+        // #patent 2026-10-26: reply landed on the pinned file (turn closed), then
+        // the CLI forked the conversation into a NEW transcript holding the same
+        // user row + the same end_turn. Replaying it emitted a second turn_complete
+        // → a duplicate channel message. The roll must still be learned as the pin
+        // (later turns land there) but read from its end.
+        let dir = std::env::temp_dir().join(format!("lbrs-roll-closed-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let turn = concat!(
+            "{\"type\":\"user\",\"message\":{\"content\":\"say ok\"}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"stop_reason\":\"end_turn\",",
+            "\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\n"
+        );
+        let pinned = dir.join("2b2052fa-0000-0000-0000-000000000000.jsonl");
+        std::fs::write(&pinned, "").unwrap();
+        let mut w = JsonlWatcher::new(dir.clone());
+        w.begin_turn();
+        assert_eq!(w.file.as_ref(), Some(&pinned));
+        std::fs::write(&pinned, turn).unwrap();
+        let first = w.poll();
+        assert!(
+            first.iter().any(|e| e["event"] == "turn_complete"),
+            "the reply on the pinned file closes the turn: {first:?}"
+        );
+        assert!(w.completed_since_pin);
+        // 300 ms later: the fork, a brand-new file with the same turn in it.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let fresh = dir.join("650e4db0-0000-0000-0000-000000000000.jsonl");
+        std::fs::write(&fresh, turn).unwrap();
+        let again = w.poll();
+        assert!(
+            !again.iter().any(|e| e["event"] == "turn_complete"),
+            "a closed turn must not complete twice: {again:?}"
+        );
+        assert_eq!(w.file.as_ref(), Some(&fresh), "the rolled file is still adopted as the pin");
+        assert_eq!(w.pos, std::fs::metadata(&fresh).unwrap().len(), "…read from its end");
+        // and an OPEN turn still rolls from 0 (the resumed-session dark-turn fix)
+        w.begin_turn();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let fresh2 = dir.join("77777777-0000-0000-0000-000000000000.jsonl");
+        std::fs::write(&fresh2, turn).unwrap();
+        let rolled = w.poll();
+        assert!(rolled.iter().any(|e| e["event"] == "turn_complete"), "open turn reads the roll: {rolled:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

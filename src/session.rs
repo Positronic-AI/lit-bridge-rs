@@ -110,6 +110,8 @@ pub struct Session {
     pub frozen_since: Option<Instant>,
     /// First time the submit loop parked on a busy spinner (breadcrumb once per paste).
     pub spinner_hold_logged: Option<Instant>,
+    /// The stale-spinner release was logged for this submit (once).
+    pub spinner_stale_logged: bool,
     /// Echo-probe state for the recovery ladder: which dialect we last typed
     /// the probe character in, and when. `None` = no probe outstanding.
     pub echo_probe: Option<(bool, Instant)>,
@@ -340,6 +342,7 @@ impl Session {
             submit_tries: 0,
             frozen_since: None,
             spinner_hold_logged: None,
+            spinner_stale_logged: false,
             echo_probe: None,
             proven_w32: None,
             probe_chars: 0,

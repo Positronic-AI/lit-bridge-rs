@@ -16,6 +16,9 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+
+/// How long a busy spinner may hold a pending submit while the transcript shows no turn.
+const SPINNER_HOLD_MAX: Duration = Duration::from_secs(20);
 use tokio::sync::Mutex;
 use tokio::task::LocalSet;
 
@@ -428,6 +431,7 @@ impl Monitor {
                         s.proven_w32 = None;
                         s.frozen_since = None;
                         s.spinner_hold_logged = None;
+                        s.spinner_stale_logged = false;
                         s.probe_chars = 0;
                         s.last_probe_round = None;
                         let old = s.state;
@@ -794,6 +798,7 @@ impl Monitor {
                             s.proven_w32 = None;
                             s.frozen_since = None;
                             s.spinner_hold_logged = None;
+                            s.spinner_stale_logged = false;
                             s.probe_chars = 0;
                             s.last_probe_round = None;
                             let old = s.state;
@@ -889,6 +894,23 @@ impl Monitor {
                 // resume/compaction warm-up that will consume it. Either way an
                 // Enter or a re-paste now lands in a live turn. Hold the clock.
                 let spinner_busy = self.parser.extract_spinner_line(&cap).is_some();
+                // A spinner that stays on screen while the transcript shows NO turn
+                // for this long is not the CLI working on our paste: it is a stale
+                // status line (2026-10-27 15:50: two prompts held for 300 s each on
+                // a parked session, nothing in the JSONL, the home timed out twice).
+                // After the ceiling the hold ends and the normal retry presses Enter;
+                // a real turn would have put a row in the transcript by now.
+                let spinner_stale = spinner_busy
+                    && !turn_started
+                    && s.spinner_hold_logged.map_or(false, |t| t.elapsed() > SPINNER_HOLD_MAX);
+                if spinner_stale && !s.spinner_stale_logged {
+                    eprintln!(
+                        "lit-bridge-rs: {} busy spinner for {}s with no turn in the transcript — stale; submitting anyway",
+                        s.name,
+                        s.spinner_hold_logged.map_or(0, |t| t.elapsed().as_secs())
+                    );
+                    s.spinner_stale_logged = true;
+                }
                 if in_dialog {
                     s.pending_submit = Some(Instant::now()); // re-arm; never Enter into a dialog
                 } else if turn_started
@@ -898,7 +920,7 @@ impl Monitor {
                         lit_bridge_rs::diag::log("SUBMIT_WITNESS", &format!("{} fresh transcript since pin", s.name));
                     }
                     s.pending_submit = None; // submitted — turn under way
-                } else if spinner_busy && pasted_at.elapsed() >= Duration::from_millis(700) {
+                } else if spinner_busy && !spinner_stale && pasted_at.elapsed() >= Duration::from_millis(700) {
                     if s.last_submit_try.is_some() || s.submit_tries > 0 {
                         // Breadcrumb once per hold so a dark turn shows why no retry fired.
                         if s.spinner_hold_logged.is_none() {
@@ -981,6 +1003,13 @@ impl Monitor {
                         }
                     }
                 } else if pasted_at.elapsed() > Duration::from_secs(12) {
+                    eprintln!(
+                        "lit-bridge-rs: {} not submitted {}ms after paste ({} Enters, {} re-pastes) — giving up this submit",
+                        s.name,
+                        pasted_at.elapsed().as_millis(),
+                        s.submit_tries,
+                        s.repastes
+                    );
                     s.pending_submit = None; // give up
                 } else if s
                     .last_submit_try
