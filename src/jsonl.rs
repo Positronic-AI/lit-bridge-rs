@@ -59,6 +59,8 @@ pub fn is_interrupt_row(msg: &Value) -> bool {
 
 pub struct JsonlWatcher {
     project_dir: PathBuf,
+    /// Transcripts other sessions of this daemon are pinned to (see `set_excluded`).
+    excluded: HashSet<PathBuf>,
     file: Option<PathBuf>,
     pos: u64,
     emitted_tool_ids: HashSet<String>,
@@ -164,6 +166,7 @@ impl JsonlWatcher {
     pub fn new(project_dir: PathBuf) -> Self {
         let mut w = JsonlWatcher {
             project_dir,
+            excluded: HashSet::new(),
             file: None,
             pos: 0,
             emitted_tool_ids: HashSet::new(),
@@ -202,6 +205,9 @@ impl JsonlWatcher {
         for entry in fs::read_dir(dir).ok()?.flatten() {
             let p = entry.path();
             if p.extension().map(|e| e == "jsonl").unwrap_or(false) {
+                if self.excluded.contains(&p) {
+                    continue; // a sibling session's transcript is never ours
+                }
                 if let Ok(m) = entry.metadata().and_then(|m| m.modified()) {
                     cands.push((m, p));
                 }
@@ -279,6 +285,9 @@ impl JsonlWatcher {
             if p.extension().map(|e| e == "jsonl").unwrap_or(false) {
                 if Some(&p) == cur {
                     continue;
+                }
+                if self.excluded.contains(&p) {
+                    continue; // a sibling session's transcript is never a roll target
                 }
                 let md = match entry.metadata() {
                     Ok(m) => m,
@@ -419,6 +428,36 @@ impl JsonlWatcher {
     /// the CLI is running THIS turn in a fresh file (a resume fork) even though
     /// the roll onto it may still be pending. A "submitted" witness for the
     /// submit-retry loop; see the field doc.
+    /// Transcripts other sessions of this daemon are pinned to. Two CLIs started in
+    /// one working directory share a projects folder; without this a session pins
+    /// or rolls onto its sibling's file, replays the sibling's (or its own) finished
+    /// turn and flaps between the two files as each grows (jovai #bmr 2026-10-27:
+    /// 2,754 rolls and 2,297 replayed completions in 14 minutes, ~105 duplicate
+    /// posts). A sibling's file is never a candidate here; if we are pinned to one
+    /// already, re-pin at the end of whatever else is ours.
+    pub fn set_excluded(&mut self, ex: HashSet<PathBuf>) {
+        let pinned_on_sibling = self.file.as_ref().map_or(false, |f| ex.contains(f));
+        self.excluded = ex;
+        if pinned_on_sibling {
+            crate::diag::log("PIN", "pinned transcript belongs to a sibling session — re-pinning");
+            self.file = self.find_active_jsonl();
+            self.pos = self
+                .file
+                .as_ref()
+                .and_then(|f| fs::metadata(f).ok())
+                .map(|m| m.len())
+                .unwrap_or(0);
+        }
+    }
+
+    pub fn pinned_file(&self) -> Option<&PathBuf> {
+        self.file.as_ref()
+    }
+
+    pub fn project_dir(&self) -> &Path {
+        &self.project_dir
+    }
+
     pub fn new_transcript_since_pin(&self) -> bool {
         self.new_since_pin.get()
     }
@@ -945,6 +984,37 @@ mod tests {
         let p = dir.join(name);
         std::fs::write(&p, "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n").unwrap();
         p
+    }
+
+    #[test]
+    fn a_siblings_transcript_is_never_pinned_or_rolled_onto() {
+        // Two CLIs in one working directory share a projects folder (jovai #bmr
+        // 2026-10-27: coo and the email agent). A session must not pin its sibling's
+        // file nor roll onto it when it grows; its own newborn file is still adopted.
+        let dir = std::env::temp_dir().join(format!("lbrs-sibling-excl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sibling = write_conv(&dir, "cccccccc-0000-0000-0000-000000000000.jsonl");
+        let mut w = JsonlWatcher::new(dir.clone());
+        assert_eq!(w.pinned_file(), Some(&sibling), "with nothing excluded the newest conversation is pinned");
+        let mut ex = HashSet::new();
+        ex.insert(sibling.clone());
+        w.set_excluded(ex);
+        assert_ne!(w.pinned_file(), Some(&sibling), "a sibling's pin is dropped");
+        w.begin_turn();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // the sibling's own turn grows its file after our pin: not a roll target
+        let mut f = std::fs::OpenOptions::new().append(true).open(&sibling).unwrap();
+        use std::io::Write;
+        writeln!(f, "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"theirs\"}}]}}}}").unwrap();
+        drop(f);
+        assert!(w.find_rolled_transcript().is_none(), "a sibling's growth never rolls us onto its file");
+        // our own transcript, born after the pin, is adopted
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let mine = write_conv(&dir, "dddddddd-0000-0000-0000-000000000000.jsonl");
+        let (rolled, _) = w.find_rolled_transcript().expect("our newborn transcript is a roll target");
+        assert_eq!(rolled, mine);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

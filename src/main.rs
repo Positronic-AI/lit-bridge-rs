@@ -311,6 +311,19 @@ impl Monitor {
         model: Option<String>,
     ) -> Result<()> {
         let mut s = Session::spawn(key.to_string(), exe, args, cwd, env, ROWS, COLS)?;
+        // A new CLI in a working directory another session already uses must not pin
+        // that session's transcript (it has none of its own yet): exclude siblings' pins.
+        if let Some(w) = s.jsonl.as_mut() {
+            let ex: std::collections::HashSet<std::path::PathBuf> = self
+                .sessions
+                .iter()
+                .filter(|(n, _)| n.as_str() != key)
+                .filter_map(|(_, o)| o.jsonl.as_ref())
+                .filter(|ow| ow.project_dir() == w.project_dir())
+                .filter_map(|ow| ow.pinned_file().cloned())
+                .collect();
+            w.set_excluded(ex);
+        }
         s.model = model;
         self.sessions.insert(key.to_string(), s);
         Ok(())
@@ -637,7 +650,27 @@ impl Monitor {
                 self.emit(json!({"session": k, "event": "killed", "reason": "exited"})).await;
             }
         }
+        // Each session's watcher must never adopt a transcript a sibling session (same
+        // working directory, same projects folder) is pinned to — see JsonlWatcher::set_excluded.
+        let pins: Vec<(String, std::path::PathBuf, Option<std::path::PathBuf>)> = self
+            .sessions
+            .iter()
+            .filter_map(|(n, s)| {
+                s.jsonl
+                    .as_ref()
+                    .map(|w| (n.clone(), w.project_dir().to_path_buf(), w.pinned_file().cloned()))
+            })
+            .collect();
         for s in self.sessions.values_mut() {
+            let my_name = s.name.clone();
+            if let Some(w) = s.jsonl.as_mut() {
+                let ex: std::collections::HashSet<std::path::PathBuf> = pins
+                    .iter()
+                    .filter(|(n, d, f)| *n != my_name && d == w.project_dir() && f.is_some())
+                    .filter_map(|(_, _, f)| f.clone())
+                    .collect();
+                w.set_excluded(ex);
+            }
             // Session key is `lit-<user>-<agent>:<channel_id>`; the `:` anchor stops a
             // channel id from matching another that merely ends with the same text.
             let reflow_on = reflow_channel
