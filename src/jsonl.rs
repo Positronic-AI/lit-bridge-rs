@@ -41,6 +41,53 @@ pub fn cc_project_dir(working_dir: &str, config_dir: Option<&str>) -> PathBuf {
 
 /// A `user` row the CLI writes when a running turn is interrupted with Esc:
 /// every text block is an interruption marker. Real user input never is.
+/// The user-visible text of a user row: string content as is, or every `text`
+/// block joined with newlines (tool results and attachments are not text).
+pub fn user_row_text(msg: &Value) -> String {
+    match msg.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// True when the CLI submitted only the TAIL of what was pasted: the transcript's
+/// user text is a proper suffix of the sent text (whitespace collapsed) and at
+/// least 20 characters are missing. The exact signature of a paste that landed
+/// across the TUI's startup input re-init (ci-mac 2026-10-28: a 40-line prompt,
+/// two lines received). Anything else — the same text, a rewrite, a different
+/// message — is not a truncation.
+pub fn tail_truncated(sent: &str, got: &str) -> bool {
+    // The CLI records a large paste wrapped as `<pasted_content id="N">…</pasted_content>`
+    // (oum, 2026-10-29: 4,965 chars in the row for a 4,907-char paste). Compare the
+    // text inside the wrapper.
+    fn strip_wrapper(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s;
+        while let Some(i) = rest.find("<pasted_content") {
+            out.push_str(&rest[..i]);
+            match rest[i..].find('>') {
+                Some(j) => rest = &rest[i + j + 1..],
+                None => {
+                    rest = "";
+                }
+            }
+        }
+        out.push_str(rest);
+        out.replace("</pasted_content>", "")
+    }
+    fn norm(s: &str) -> String {
+        strip_wrapper(s).split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+    let (a, b) = (norm(sent), norm(got));
+    !b.is_empty() && b.chars().count() + 20 <= a.chars().count() && a.ends_with(&b)
+}
+
 pub fn is_interrupt_row(msg: &Value) -> bool {
     let texts: Vec<&str> = match msg.get("content") {
         Some(Value::String(s)) => vec![s.as_str()],
@@ -59,6 +106,9 @@ pub fn is_interrupt_row(msg: &Value) -> bool {
 
 pub struct JsonlWatcher {
     project_dir: PathBuf,
+    /// Text of the most recent genuine user row (string content, or the text blocks
+    /// joined) — what the CLI actually submitted, for the paste-truncation check.
+    last_user_text: Option<String>,
     /// Transcripts other sessions of this daemon are pinned to (see `set_excluded`).
     excluded: HashSet<PathBuf>,
     file: Option<PathBuf>,
@@ -166,6 +216,7 @@ impl JsonlWatcher {
     pub fn new(project_dir: PathBuf) -> Self {
         let mut w = JsonlWatcher {
             project_dir,
+            last_user_text: None,
             excluded: HashSet::new(),
             file: None,
             pos: 0,
@@ -422,6 +473,11 @@ impl JsonlWatcher {
     /// completion fallback must be blocked while this holds.
     pub fn turn_open(&self) -> bool {
         self.open
+    }
+
+    /// The text of the latest genuine user row, taken once (None until the next one).
+    pub fn take_last_user_text(&mut self) -> Option<String> {
+        self.last_user_text.take()
     }
 
     /// True once a transcript born after this turn's pin has been written —
@@ -815,6 +871,7 @@ impl JsonlWatcher {
                         self.pending_complete = false;
                         self.completed_since_pin = false;
                         self.reset_turn_usage();
+                        self.last_user_text = Some(user_row_text(&msg));
                     }
                     if let Some(blocks) = msg.get("content").and_then(|v| v.as_array()) {
                         for block in blocks {
@@ -1402,5 +1459,53 @@ mod tests {
             cc_project_dir(r"C:\Users\ben\lbrs-e2e2", Some("/cfg")).file_name().unwrap(),
             "C--Users-ben-lbrs-e2e2"
         );
+    }
+}
+
+#[cfg(test)]
+mod paste_truncation_tests {
+    use super::{tail_truncated, user_row_text};
+    use serde_json::json;
+
+    #[test]
+    fn tail_of_a_long_paste_is_a_truncation() {
+        let sent = "Line one of the channel preamble.\nLine two with rules.\nLine three.\nThe actual ask: do the thing.";
+        let got = "Line three.\nThe actual ask: do the thing.";
+        assert!(tail_truncated(sent, got));
+    }
+
+    #[test]
+    fn same_text_rewrapped_is_not_a_truncation() {
+        let sent = "Please  look at\n  the file and\treport.";
+        assert!(!tail_truncated(sent, "Please look at the file and report."));
+        assert!(!tail_truncated(sent, sent));
+    }
+
+    #[test]
+    fn a_different_message_or_a_trivial_trim_is_not_a_truncation() {
+        assert!(!tail_truncated("Hello there, run the tests please", "run the tests please now"));
+        assert!(!tail_truncated("ACK: m — ok.\nThanks", "Thanks")); // < 20 chars missing
+        assert!(!tail_truncated("anything", ""));
+    }
+
+    #[test]
+    fn the_pasted_content_wrapper_is_ignored() {
+        let sent = "Line one of the channel preamble.\nLine two with rules.\nLine three.\nThe actual ask: do the thing.";
+        let whole = format!("<pasted_content id=\"9972\">\n{}\n</pasted_content>", sent);
+        assert!(!tail_truncated(sent, &whole));
+        let tail = "<pasted_content id=\"3\">\nLine three.\nThe actual ask: do the thing.\n</pasted_content>";
+        assert!(tail_truncated(sent, tail));
+    }
+
+    #[test]
+    fn user_row_text_reads_strings_and_text_blocks() {
+        assert_eq!(user_row_text(&json!({"content": "hi there"})), "hi there");
+        let blocks = json!({"content": [
+            {"type": "text", "text": "first"},
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ignored"},
+            {"type": "text", "text": "second"}
+        ]});
+        assert_eq!(user_row_text(&blocks), "first\nsecond");
+        assert_eq!(user_row_text(&json!({"content": [{"type": "tool_result", "content": "x"}]})), "");
     }
 }

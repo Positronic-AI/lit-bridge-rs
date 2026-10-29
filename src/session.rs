@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -55,6 +55,15 @@ pub struct Session {
     pub paste_ready: Arc<AtomicBool>,
     /// Spawn wall-clock — the paste gate's fallback ceiling measures from here.
     pub spawned_at: Instant,
+    /// Milliseconds after `spawned_at` of the CLI's most recent output chunk. The
+    /// startup paste gate waits for a STABLE prompt box: beacon seen AND nothing
+    /// painted for a few hundred ms (2026-10-28 ci-mac: the first prompt was pasted
+    /// while the welcome screen was still painting and only its last two lines
+    /// survived the TUI's input re-init).
+    pub last_out_ms: Arc<AtomicU64>,
+    /// Re-paste attempts after a submit whose transcript row held only the tail of
+    /// what was pasted. Bounded to one per turn.
+    pub truncation_repastes: u8,
     /// When the blocking dialog was first seen (for the held-too-long error).
     pub dialog_since: Option<Instant>,
     /// One held-too-long error per blockage.
@@ -169,6 +178,15 @@ impl Session {
         self.output_bytes() != self.sent_at_bytes
     }
 
+    /// True when the CLI has painted nothing for at least `ms` milliseconds — the
+    /// "stable screen" half of the startup paste gate. A blinking cursor repaints
+    /// about twice a second, so 300 ms fits between blinks while a boot repaint
+    /// (many chunks per 100 ms) keeps this false.
+    pub fn quiet_for(&self, ms: u64) -> bool {
+        let now = self.spawned_at.elapsed().as_millis() as u64;
+        now.saturating_sub(self.last_out_ms.load(Ordering::Relaxed)) >= ms
+    }
+
     pub fn win32_active(&self) -> bool {
         self.win32.load(Ordering::Relaxed)
     }
@@ -232,6 +250,8 @@ impl Session {
         let mut reader = pair.master.try_clone_reader()?;
         let win32 = Arc::new(AtomicBool::new(false));
         let paste_ready = Arc::new(AtomicBool::new(false));
+        let last_out_ms = Arc::new(AtomicU64::new(0));
+        let spawned_at = Instant::now();
         let out_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         {
             let s = screen.clone();
@@ -239,6 +259,8 @@ impl Session {
             let win32_r = win32.clone();
             let paste_r = paste_ready.clone();
             let out_r = out_bytes.clone();
+            let last_out_r = last_out_ms.clone();
+            let t0 = spawned_at;
             // Diagnostic: dump raw PTY output to a file when LIT_BRIDGE_RS_RAWLOG is set.
             // Inert in production; used to inspect the CLI's terminal-capability handshake.
             let raw_log = std::env::var("LIT_BRIDGE_RS_RAWLOG").ok();
@@ -254,6 +276,7 @@ impl Session {
                         Ok(n) => {
                             let chunk = &buf[..n];
                             out_r.fetch_add(n as u64, Ordering::Relaxed);
+                            last_out_r.store(t0.elapsed().as_millis() as u64, Ordering::Relaxed);
                             // Track the CLI's win32-input-mode negotiation so input is
                             // encoded correctly (Windows interactive TUI).
                             if chunk.windows(8).any(|w| w == b"\x1b[?9001h") {
@@ -319,7 +342,9 @@ impl Session {
             pending_text: None,
             repastes: 0,
             paste_ready,
-            spawned_at: Instant::now(),
+            spawned_at,
+            last_out_ms,
+            truncation_repastes: 0,
             dialog_since: None,
             dialog_notified: false,
             question_emitted: false,

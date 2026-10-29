@@ -333,15 +333,18 @@ impl Monitor {
         let key = Self::session_key(cmd);
         let content = cmd.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
         // Baseline the assistant-message count before sending, for completion detection.
-        let (baseline, dialog) = match self.sessions.get(&key) {
+        let (baseline, dialog, prompt_stable) = match self.sessions.get(&key) {
             Some(s) => {
                 let cap = s.capture();
-                let dialog = if self.parser.detect_state(&cap) == SessionState::Dialog {
+                let state = self.parser.detect_state(&cap);
+                let dialog = if state == SessionState::Dialog {
                     Some((bottom_excerpt(&cap), self.parser.parse_dialog_question(&cap)))
                 } else {
                     None
                 };
-                (self.parser.count_assistant_messages(&cap), dialog)
+                let prompt_owns_input = state == SessionState::Idle
+                    || self.parser.startup_action(&cap) == StartupAction::Prompt;
+                (self.parser.count_assistant_messages(&cap), dialog, startup_paste_ok(s, prompt_owns_input))
             }
             None => {
                 self.emit(json!({"session": key, "event": "error", "message": "session not found"}))
@@ -396,14 +399,13 @@ impl Monitor {
         // fragment — the cold-spawn "first message vanishes" failure. Hold the
         // message; the poll loop delivers it the moment the beacon appears (or
         // after the age ceiling, as a never-strand fallback).
-        let paste_pending = self
-            .sessions
-            .get(&key)
-            .map(|s| {
-                !s.paste_ready.load(std::sync::atomic::Ordering::Relaxed)
-                    && s.spawned_at.elapsed() < Duration::from_secs(30)
-            })
-            .unwrap_or(false);
+        // 2026-10-29: the beacon alone is not enough. On a brand-new machine the
+        // CLI enables bracketed paste, then keeps painting its welcome screen and
+        // re-initialises its input box; a paste that lands across that re-init
+        // loses its head and the retry Enter submits the tail (ci-mac 2026-10-28).
+        // So the gate is a STABLE prompt box: beacon seen, nothing painted for
+        // 300 ms, and the prompt box the active widget. See startup_paste_ok.
+        let paste_pending = !prompt_stable;
         if paste_pending {
             if let Some(s) = self.sessions.get_mut(&key) {
                 s.pending_text = Some(match s.pending_text.take() {
@@ -797,8 +799,6 @@ impl Monitor {
                 // Startup paste gate (see cmd_send): a held message also waits for
                 // the CLI's bracketed-paste beacon — or the age ceiling, so an
                 // unexpected TUI can never strand a message forever.
-                let paste_ok = s.paste_ready.load(std::sync::atomic::Ordering::Relaxed)
-                    || s.spawned_at.elapsed() >= Duration::from_secs(30);
                 // "Idle" by either witness: detect_state, or the startup rule
                 // (prompt box as the last widget on screen). On Windows the
                 // scrape can be blank-but-for-the-prompt after a dismissed
@@ -807,6 +807,7 @@ impl Monitor {
                 // relayed, dismissed, message never released).
                 let prompt_owns_input = new_state == SessionState::Idle
                     || self.parser.startup_action(&cap) == StartupAction::Prompt;
+                let paste_ok = startup_paste_ok(s, prompt_owns_input);
                 if prompt_owns_input && busy_spinner.is_none() && paste_ok {
                     let content = s.pending_text.take().unwrap();
                     s.dialog_since = None;
@@ -953,6 +954,47 @@ impl Monitor {
                         lit_bridge_rs::diag::log("SUBMIT_WITNESS", &format!("{} fresh transcript since pin", s.name));
                     }
                     s.pending_submit = None; // submitted — turn under way
+                    // Verify WHAT was submitted. The transcript's user row is the
+                    // CLI's own record; if it holds only the tail of the paste, the
+                    // head was lost to the TUI's startup re-init. Interrupt the
+                    // turn (Esc — the CLI records it as an interrupt row, which
+                    // closes the turn without a completion) and hold the full text
+                    // for the dispatch path above, which re-pastes it the moment the
+                    // prompt is idle and stable. Once per turn; after that, log only.
+                    if jsonl_submitted {
+                        if let Some(got) = s.jsonl.as_mut().and_then(|j| j.take_last_user_text()) {
+                            if lit_bridge_rs::jsonl::tail_truncated(&s.sent, &got) {
+                                let (sent_n, got_n) = (s.sent.chars().count(), got.chars().count());
+                                if s.truncation_repastes < 1 {
+                                    s.truncation_repastes += 1;
+                                    eprintln!(
+                                        "lit-bridge-rs: {} submitted only the tail of the paste ({} of {} chars) — interrupting and re-pasting",
+                                        s.name, got_n, sent_n
+                                    );
+                                    lit_bridge_rs::diag::log(
+                                        "PASTE_TRUNCATED",
+                                        &format!("{} got {} of {} chars; interrupt + re-paste", s.name, got_n, sent_n),
+                                    );
+                                    events.push(json!({
+                                        "session": s.name.clone(), "event": "prompt_truncated",
+                                        "sent_chars": sent_n, "got_chars": got_n, "action": "repaste"
+                                    }));
+                                    let _ = s.send_key("Esc");
+                                    s.mark_sent();
+                                    s.pending_text = Some(s.sent.clone());
+                                } else {
+                                    eprintln!(
+                                        "lit-bridge-rs: {} submitted only the tail of the paste again ({} of {} chars) — leaving it",
+                                        s.name, got_n, sent_n
+                                    );
+                                    events.push(json!({
+                                        "session": s.name.clone(), "event": "prompt_truncated",
+                                        "sent_chars": sent_n, "got_chars": got_n, "action": "none"
+                                    }));
+                                }
+                            }
+                        }
+                    }
                 } else if spinner_busy && !spinner_stale && pasted_at.elapsed() >= Duration::from_millis(700) {
                     if s.last_submit_try.is_some() || s.submit_tries > 0 {
                         // Breadcrumb once per hold so a dark turn shows why no retry fired.
@@ -1506,6 +1548,21 @@ async fn finalize_create(
             "model": model, "resumed": resumed
         }))
         .await;
+}
+
+/// The startup paste gate (2026-07-30 beacon rule + 2026-10-29 stable-screen rule).
+/// Before the CLI's input layer is live and the screen has settled, a paste races
+/// the TUI's boot: the markers are eaten (first message "2") or the head is lost
+/// to the input re-init (ci-mac: two of forty lines). Ready when ALL of:
+///   - bracketed paste enabled (ESC[?2004h seen),
+///   - nothing painted for 300 ms,
+///   - the prompt box is the active widget (`prompt_owns_input`);
+/// or when the session is 30 s old — the never-strand ceiling, as before.
+fn startup_paste_ok(s: &Session, prompt_owns_input: bool) -> bool {
+    if s.spawned_at.elapsed() >= Duration::from_secs(30) {
+        return true;
+    }
+    s.paste_ready.load(std::sync::atomic::Ordering::Relaxed) && s.quiet_for(300) && prompt_owns_input
 }
 
 /// Bridge a raw terminal-attach connection to a session's PTY. Protocol: the client
