@@ -530,6 +530,29 @@ impl Session {
             self.writer.flush()?;
             return Ok(());
         }
+        // POSIX: the text used to go out raw, counting on the TUI's burst-of-input
+        // paste heuristic. A fresh CLI on a slow box reads a 5 KB write in pieces,
+        // and only the last piece became the paste (GitHub macOS 15 arm64 runners,
+        // 2026-11-01: 50 of 5096 characters, every time, echo probe or not). Once
+        // the CLI has enabled bracketed paste (ESC[?2004h, the beacon), wrap the
+        // text in the paste markers: the CLI then accumulates everything up to the
+        // end marker however the bytes arrive — the same contract the win32 path
+        // and tmux's paste-buffer have always used. Before the beacon, raw as before.
+        if self.paste_ready.load(Ordering::Relaxed) {
+            let mut out: Vec<u8> = Vec::with_capacity(text.len() + 16);
+            out.extend_from_slice(b"\x1b[200~");
+            for ch in text.chars() {
+                if ch == '\r' {
+                    continue; // normalize CRLF -> LF
+                }
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+            out.extend_from_slice(b"\x1b[201~");
+            self.writer.write_all(&out)?;
+            self.writer.flush()?;
+            return Ok(());
+        }
         self.writer.write_all(text.as_bytes())?;
         self.writer.flush()?;
         Ok(())
