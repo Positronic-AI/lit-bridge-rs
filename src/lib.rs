@@ -3,6 +3,7 @@
 
 pub mod diag;
 pub mod jsonl;
+pub mod pane;
 pub mod parser;
 pub mod reflow;
 pub mod session;

@@ -684,10 +684,10 @@ impl Monitor {
                 .unwrap_or(false);
             // When reflow is on, grab the per-row classification from the SAME screen
             // lock as the text so `row_kinds` stays aligned with `cap`'s lines.
-            let (cap, row_kinds) = if reflow_on {
+            let (cap, row_kinds, pane_cols) = if reflow_on {
                 s.capture_with_kinds()
             } else {
-                (s.capture(), Vec::new())
+                (s.capture(), Vec::new(), COLS)
             };
             // Reset the quiescence clock whenever the screen changes.
             if cap != s.last {
@@ -1303,7 +1303,7 @@ impl Monitor {
                                 Some(&s.sent),
                                 0,
                                 &row_kinds,
-                                COLS as usize,
+                                pane_cols as usize,
                             )
                         } else {
                             self.parser

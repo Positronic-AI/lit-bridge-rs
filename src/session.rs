@@ -457,10 +457,19 @@ impl Session {
         }
     }
 
+    /// The screen as text — the conversation pane only when the CLI's diff panel
+    /// is open (see `pane`), so the parser never reads the panel's text as part of
+    /// the response.
     pub fn capture(&self) -> String {
         self.screen
             .lock()
-            .map(|g| g.screen().contents())
+            .map(|g| {
+                let screen = g.screen();
+                match crate::pane::border(screen) {
+                    Some(c) => crate::pane::contents_left_of(screen, c),
+                    None => screen.contents(),
+                }
+            })
             .unwrap_or_default()
     }
 
@@ -468,17 +477,23 @@ impl Session {
     /// blank) from the SAME screen lock, so `row_kinds[i]` stays aligned with screen line
     /// `i` for the reflow path. Only called when reflow is enabled (the per-row cell scan
     /// isn't free), so plain `capture` stays the hot path.
-    pub fn capture_with_kinds(&self) -> (String, Vec<crate::reflow::RowKind>) {
+    /// Also returns the pane width the rows were cut to (the full terminal width
+    /// when no diff panel is open): the reflow's un-wrap test needs the width the
+    /// CLI actually wrapped prose to.
+    pub fn capture_with_kinds(&self) -> (String, Vec<crate::reflow::RowKind>, u16) {
         self.screen
             .lock()
             .map(|g| {
                 let screen = g.screen();
                 let (rows, cols) = screen.size();
-                let text = screen.contents();
+                let (text, width) = match crate::pane::border(screen) {
+                    Some(c) => (crate::pane::contents_left_of(screen, c), c),
+                    None => (screen.contents(), cols),
+                };
                 let kinds = (0..rows)
-                    .map(|r| crate::reflow::classify_row(screen, r, cols))
+                    .map(|r| crate::reflow::classify_row(screen, r, width))
                     .collect();
-                (text, kinds)
+                (text, kinds, width)
             })
             .unwrap_or_default()
     }
