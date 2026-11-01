@@ -64,6 +64,15 @@ pub struct Session {
     /// Re-paste attempts after a submit whose transcript row held only the tail of
     /// what was pasted. Bounded to one per turn.
     pub truncation_repastes: u8,
+    /// Cold-start input probe (2026-11-01). A fresh CLI enables bracketed paste and
+    /// paints a stable prompt box — and then re-initialises that box once more. A
+    /// paste landing across the re-init keeps only its last ~50 characters (GitHub
+    /// macOS runners: 7 of 8 smoke legs; the re-paste after the interrupt lost its
+    /// head the same way). So before the first paste of a session, and again before
+    /// a re-paste after a truncation, one character is typed and must be echoed
+    /// back, then removed: only an input layer that echoes is taken as live.
+    pub cold_proven: bool,
+    pub cold_probe: Option<(bool, Instant)>,
     /// When the blocking dialog was first seen (for the held-too-long error).
     pub dialog_since: Option<Instant>,
     /// One held-too-long error per blockage.
@@ -345,6 +354,8 @@ impl Session {
             spawned_at,
             last_out_ms,
             truncation_repastes: 0,
+            cold_proven: false,
+            cold_probe: None,
             dialog_since: None,
             dialog_notified: false,
             question_emitted: false,

@@ -344,7 +344,10 @@ impl Monitor {
                 };
                 let prompt_owns_input = state == SessionState::Idle
                     || self.parser.startup_action(&cap) == StartupAction::Prompt;
-                (self.parser.count_assistant_messages(&cap), dialog, startup_paste_ok(s, prompt_owns_input))
+                // A cold session (no echoed keystroke yet) always goes through the
+                // held path, where the input layer is probed before the paste.
+                (self.parser.count_assistant_messages(&cap), dialog,
+                 startup_paste_ok(s, prompt_owns_input) && s.cold_proven)
             }
             None => {
                 self.emit(json!({"session": key, "event": "error", "message": "session not found"}))
@@ -808,7 +811,55 @@ impl Monitor {
                 let prompt_owns_input = new_state == SessionState::Idle
                     || self.parser.startup_action(&cap) == StartupAction::Prompt;
                 let paste_ok = startup_paste_ok(s, prompt_owns_input);
-                if prompt_owns_input && busy_spinner.is_none() && paste_ok {
+                if prompt_owns_input && busy_spinner.is_none() && paste_ok && !s.cold_proven {
+                    // COLD-START PROBE (see Session::cold_proven): type one character,
+                    // raw then as a win32 record, and paste only once the CLI has echoed
+                    // it and the probe is backspaced away. The stable-screen gate above
+                    // passes during the TUI's last input-box re-init; the echo does not.
+                    match s.cold_probe {
+                        None => {
+                            let cadence_ok = s
+                                .last_probe_round
+                                .map_or(true, |t| t.elapsed() > Duration::from_millis(2500));
+                            if cadence_ok {
+                                s.last_probe_round = Some(Instant::now());
+                                let _ = s.send_char('x', false);
+                                s.probe_chars = s.probe_chars.saturating_add(1);
+                                s.mark_sent();
+                                s.cold_probe = Some((false, Instant::now()));
+                                lit_bridge_rs::diag::log("COLD_PROBE", &format!("{} typed (raw)", s.name));
+                            }
+                        }
+                        Some((w32, at)) => {
+                            if s.reacted_since_send() {
+                                let n = s.probe_chars as usize;
+                                let _ = s.backspace_in(n, w32);
+                                s.probe_chars = 0;
+                                s.mark_sent();
+                                s.proven_w32 = Some(w32);
+                                s.cold_probe = None;
+                                s.cold_proven = true;
+                                eprintln!(
+                                    "lit-bridge-rs: {} input layer echoes ({}) — pasting once the screen settles",
+                                    s.name,
+                                    if w32 { "win32 records" } else { "raw bytes" }
+                                );
+                                lit_bridge_rs::diag::log("COLD_PROBE", &format!("{} echoed; proven", s.name));
+                            } else if at.elapsed() > Duration::from_millis(700) {
+                                if !w32 {
+                                    let _ = s.send_char('x', true);
+                                    s.probe_chars = s.probe_chars.saturating_add(1);
+                                    s.mark_sent();
+                                    s.cold_probe = Some((true, Instant::now()));
+                                    lit_bridge_rs::diag::log("COLD_PROBE", &format!("{} typed (win32)", s.name));
+                                } else {
+                                    s.cold_probe = None; // re-probe on cadence
+                                    lit_bridge_rs::diag::log("COLD_PROBE", &format!("{} no echo in either dialect", s.name));
+                                }
+                            }
+                        }
+                    }
+                } else if prompt_owns_input && busy_spinner.is_none() && paste_ok {
                     let content = s.pending_text.take().unwrap();
                     s.dialog_since = None;
                     s.dialog_notified = false;
@@ -982,6 +1033,8 @@ impl Monitor {
                                     let _ = s.send_key("Esc");
                                     s.mark_sent();
                                     s.pending_text = Some(s.sent.clone());
+                                    s.cold_proven = false; // the interrupt re-inits the box: probe again
+                                    s.cold_probe = None;
                                 } else {
                                     eprintln!(
                                         "lit-bridge-rs: {} submitted only the tail of the paste again ({} of {} chars) — leaving it",
