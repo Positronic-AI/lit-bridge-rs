@@ -46,6 +46,10 @@ pub struct ClaudeV21Parser {
     re_response: Regex,
     re_completion: Regex, // ^\s*✻\s+(.+)  — lookahead handled in code
     re_spinner_active: Regex,
+    // Claude Code's system notices render as `●` rows (`● Compacted while idle, …`,
+    // 2.1.3xx idleCompaction). They are not a live response: a session resumed
+    // after one ends its screen with that row and no `✻ …` completion after it.
+    re_compaction_notice: Regex,
     re_thinking_spinner: Regex,
     re_separator: Regex,
     re_status: Regex,
@@ -71,6 +75,7 @@ impl ClaudeV21Parser {
             re_response: Regex::new(r"^\s*●\s").unwrap(),
             re_completion: Regex::new(r"^\s*✻\s+(.+)").unwrap(),
             re_spinner_active: Regex::new(r"^\s*[·✢-✿]\s+.*…").unwrap(),
+            re_compaction_notice: Regex::new(r"^\s*●\s+(Compacted while idle|Conversation compacted)").unwrap(),
             re_thinking_spinner: Regex::new(r"^\s*[·✢-✿]\s").unwrap(),
             re_separator: Regex::new(r"^─{10,}$").unwrap(),
             re_status: Regex::new(r"^\s*[⏵▸]").unwrap(),
@@ -146,9 +151,14 @@ impl ClaudeV21Parser {
             // so it must NOT disqualify the bullet — that latch left state stuck on
             // Thinking for the whole turn, so the scrape-stream gate never opened and
             // the web showed only ellipses until the final JSONL dump.
+            // A compaction notice is a boundary too: it is the last `●` row of a
+            // screen resumed after an idle compaction, and the bridge read it as
+            // Responding for 15 minutes (#lit-platform 2026-11-03: every message
+            // held at the startup gate, the home gave up at 300 s).
             return !after
                 .lines()
-                .any(|l| self.is_completion(l.trim()) || self.re_user.is_match(l));
+                .any(|l| self.is_completion(l.trim()) || self.re_user.is_match(l)
+                    || self.re_compaction_notice.is_match(l));
         }
         false
     }

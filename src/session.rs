@@ -128,6 +128,8 @@ pub struct Session {
     pub frozen_since: Option<Instant>,
     /// First time the submit loop parked on a busy spinner (breadcrumb once per paste).
     pub spinner_hold_logged: Option<Instant>,
+    /// Last time a startup hold past the ceiling was described in the diag log.
+    pub hold_logged_at: Option<Instant>,
     /// The stale-spinner release was logged for this submit (once).
     pub spinner_stale_logged: bool,
     /// Echo-probe state for the recovery ladder: which dialect we last typed
@@ -378,6 +380,7 @@ impl Session {
             submit_tries: 0,
             frozen_since: None,
             spinner_hold_logged: None,
+            hold_logged_at: None,
             spinner_stale_logged: false,
             echo_probe: None,
             proven_w32: None,

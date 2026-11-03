@@ -799,6 +799,7 @@ impl Monitor {
                 // counts as not-yet-idle: keep holding, and relay the live
                 // animation below so the web sees what the terminal sees.
                 let busy_spinner = self.parser.extract_spinner_line(&cap);
+                let spinner_on_screen = busy_spinner.is_some();
                 // Startup paste gate (see cmd_send): a held message also waits for
                 // the CLI's bracketed-paste beacon — or the age ceiling, so an
                 // unexpected TUI can never strand a message forever.
@@ -918,6 +919,20 @@ impl Monitor {
                                 s.last_thinking = Some(spin);
                             }
                         }
+                    }
+                    // A hold that outlives the startup ceiling is the parser disagreeing
+                    // with the screen (2026-11-03 #lit-platform: a resumed screen ending in
+                    // the idle-compaction notice read as Responding for 15 min, every
+                    // message held, nothing relayed). Describe the screen every 30 s so
+                    // the next one is diagnosable from the evt log.
+                    if s.spawned_at.elapsed() > Duration::from_secs(30)
+                        && s.hold_logged_at.map_or(true, |t| t.elapsed() > Duration::from_secs(30))
+                    {
+                        s.hold_logged_at = Some(Instant::now());
+                        let last = cap.lines().rev().map(str::trim_end).find(|l| !l.trim().is_empty()).unwrap_or("");
+                        lit_bridge_rs::diag::log("HOLD", &format!(
+                            "{} held: state={} prompt_owns_input={} spinner={} last_line={:?}",
+                            s.name, new_state.as_str(), prompt_owns_input, spinner_on_screen, last));
                     }
                     if let Some(since) = s.dialog_since {
                         // When a structured question card is out, the card is the
