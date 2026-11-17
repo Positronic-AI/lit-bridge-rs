@@ -50,6 +50,10 @@ pub struct ClaudeV21Parser {
     // 2.1.3xx idleCompaction). They are not a live response: a session resumed
     // after one ends its screen with that row and no `✻ …` completion after it.
     re_compaction_notice: Regex,
+    // The welcome banner's first row: logo glyphs, then `Claude Code vX.Y.Z` and
+    // nothing after it. Anchored that tightly so prose that merely names a
+    // version never matches.
+    re_banner: Regex,
     re_thinking_spinner: Regex,
     re_separator: Regex,
     re_status: Regex,
@@ -76,6 +80,7 @@ impl ClaudeV21Parser {
             re_completion: Regex::new(r"^\s*✻\s+(.+)").unwrap(),
             re_spinner_active: Regex::new(r"^\s*[·✢-✿]\s+.*…").unwrap(),
             re_compaction_notice: Regex::new(r"^\s*●\s+(Compacted while idle|Conversation compacted)").unwrap(),
+            re_banner: Regex::new(r"^\s*[▐▛▜▌▝▘▀▄█ ]*█[▐▛▜▌▝▘▀▄█ ]*\s*Claude Code\s*v[\d.]+\s*$").unwrap(),
             re_thinking_spinner: Regex::new(r"^\s*[·✢-✿]\s").unwrap(),
             re_separator: Regex::new(r"^─{10,}$").unwrap(),
             re_status: Regex::new(r"^\s*[⏵▸]").unwrap(),
@@ -144,6 +149,20 @@ impl ClaudeV21Parser {
         let content_area = content_lines.join("\n");
         if let Some(pos) = content_area.rfind('●') {
             let after = &content_area[pos..];
+            // Nothing the assistant says can come before the first user message.
+            // A `●` row with the welcome banner above it and no user line in
+            // between is a startup notice, not a reply: a Team or Enterprise seat
+            // paints `● Your organization may apply global configuration to
+            // Claude Code. …` under the banner on a fresh session. Read as a live
+            // response, it held the first message of a new channel at the startup
+            // gate until the home gave up at 300 s, and every resend after it
+            // (Harborview stage, 2026-11-17; the same hold on jupiter 2026-11-10).
+            let before: Vec<&str> = content_area[..pos].lines().collect();
+            if let Some(b) = before.iter().rposition(|l| self.re_banner.is_match(l)) {
+                if !before[b + 1..].iter().any(|l| self.re_user.is_match(l)) {
+                    return false;
+                }
+            }
             // The bullet is the live tail UNLESS a prior-turn boundary sits between
             // it and the screen bottom: a `✻ …(duration)` completion marker or a `❯`
             // user line. An ACTIVE spinner (`✻ Thinking… (36s)`, no duration) parked
