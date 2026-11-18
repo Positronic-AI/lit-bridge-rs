@@ -810,7 +810,8 @@ impl Monitor {
                 // held message then sat forever (2026-08-21 hunt-1-85: dialog
                 // relayed, dismissed, message never released).
                 let prompt_owns_input = new_state == SessionState::Idle
-                    || self.parser.startup_action(&cap) == StartupAction::Prompt;
+                    || self.parser.startup_action(&cap) == StartupAction::Prompt
+                    || settled_reply(new_state, spinner_on_screen, s.last_change.elapsed() >= SETTLED_REPLY_QUIET, &cap);
                 let paste_ok = startup_paste_ok(s, prompt_owns_input);
                 if prompt_owns_input && busy_spinner.is_none() && paste_ok && !s.cold_proven {
                     // COLD-START PROBE (see Session::cold_proven): type one character,
@@ -1618,6 +1619,27 @@ async fn finalize_create(
         .await;
 }
 
+/// A reply that is on screen but no longer being written (2026-11-18 #demo-videos: a
+/// CLI resumed from a conversation whose last turn was cut off paints that turn's
+/// final `●` line with no `✻ … done` marker under it; the parser read "responding"
+/// and every message was held for three hours). A live reply always animates its
+/// spinner row, so a screen that reads Responding with NO spinner, whose text has
+/// not changed for `SETTLED_REPLY_QUIET`, and with the prompt box at the bottom is a
+/// finished or abandoned reply: the prompt owns input.
+const SETTLED_REPLY_QUIET: Duration = Duration::from_secs(20);
+
+fn settled_reply(state: SessionState, spinner_on_screen: bool, quiet: bool, capture: &str) -> bool {
+    state == SessionState::Responding
+        && !spinner_on_screen
+        && quiet
+        && capture
+            .lines()
+            .rev()
+            .filter(|l| !l.trim().is_empty())
+            .take(6)
+            .any(|l| l.trim_start().starts_with('❯'))
+}
+
 /// The startup paste gate (2026-07-30 beacon rule + 2026-10-29 stable-screen rule).
 /// Before the CLI's input layer is live and the screen has settled, a paste races
 /// the TUI's boot: the markers are eaten (first message "2") or the head is lost
@@ -1972,6 +1994,32 @@ fn effective_state(screen: SessionState, transcript_turn_open: bool) -> SessionS
 #[cfg(test)]
 mod dialog_gate_tests {
     use super::*;
+
+    /// 2026-11-18 #demo-videos: the screen a CLI resumed into after its last turn was
+    /// cut off. No `✻ … done` marker under the final `●` line, no spinner.
+    const RESUMED_AFTER_A_CUT_TURN: &str = "\
+● It assembled to 2:01. Before posting I'm checking frames from each beat.
+✘ Auto-update failed: no write permission to npm prefix · Run claude doctor
+──────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+";
+
+    #[test]
+    fn a_cut_off_reply_on_a_still_screen_stops_holding_messages() {
+        let p = lit_bridge_rs::parser::select_parser("claude-code").unwrap();
+        // The parser alone still reads this screen as a reply in progress.
+        assert_eq!(p.detect_state(RESUMED_AFTER_A_CUT_TURN), SessionState::Responding);
+        assert!(settled_reply(SessionState::Responding, false, true, RESUMED_AFTER_A_CUT_TURN));
+        // Still changing, or a spinner on screen: a live reply, keep holding.
+        assert!(!settled_reply(SessionState::Responding, false, false, RESUMED_AFTER_A_CUT_TURN));
+        assert!(!settled_reply(SessionState::Responding, true, true, RESUMED_AFTER_A_CUT_TURN));
+        // No prompt box at the bottom (a modal owns the screen): keep holding.
+        assert!(!settled_reply(SessionState::Responding, false, true, "● Working on it.\n  Do you trust this folder?\n"));
+        // Other states are not this rule's business.
+        assert!(!settled_reply(SessionState::Dialog, false, true, RESUMED_AFTER_A_CUT_TURN));
+    }
 
     #[test]
     fn an_open_transcript_turn_overrides_an_idle_prompt() {
